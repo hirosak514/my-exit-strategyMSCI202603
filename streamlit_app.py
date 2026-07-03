@@ -314,19 +314,29 @@ for i, (key, info) in enumerate(st.session_state.portfolio.items()):
         if info['shares'] == 0:
             p_jpy = 0
         else:
-            if "_SHORT" in key:
-                label, p_jpy = "信用(売建)", (info['cost'] - cur) * info['shares']
-            elif "_MARGIN_LONG" in key:
-                label, p_jpy = "信用(買建)", (cur - info['cost']) * info['shares']
-            else:
-                label = "現物"
-                if info.get('currency') == "USD":
-                    p_usd = (cur - info['cost']) * info['shares']
-                    p_jpy = p_usd * rate
-                    total_profit_usd_only_us_stocks += p_usd
-                else: p_jpy = (cur - info['cost']) * info['shares']
+        # --- [修正版] 損益計算ロジック ---
+        if "_SHORT" in key:
+            label = "信用(売建)"
+            diff = info['cost'] - cur
+        elif "_MARGIN_LONG" in key:
+            label = "信用(買建)"
+            diff = cur - info['cost']
+        else:
+            label = "現物"
+            diff = cur - info['cost']
+
+        if info.get('currency') == "USD":
+            p_usd = diff * info['shares']
+            p_jpy = p_usd * rate
+            total_profit_usd_only_us_stocks += p_usd
+        else:
+            p_jpy = diff * info['shares']
+
+        if info['shares'] == 0:
+            p_jpy = 0
 
         total_profit_jpy += p_jpy
+        # ---------------------------------
         cost_display = f"${info['cost']:,}" if info.get('currency') == "USD" else f"¥{info['cost']:,}"
         cur_display = f"{('$' if info.get('currency') == 'USD' else '¥')}{cur:,.2f} {day_change_pct}"
         
