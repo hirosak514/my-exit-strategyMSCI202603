@@ -453,45 +453,71 @@ total_profit_jpy = 0
 total_profit_usd_only_us_stocks = 0
 
 for i, (key, info) in enumerate(st.session_state.portfolio.items()):
+    shares = info.get('shares', 0)
+    if shares < 0:
+        continue
+
     p_data = prices_dict.get(key)
-    if p_data and info.get('shares', 0) >= 0:
-        cur, prev = p_data["current"], p_data["prev_close"]
-        day_change_pct = f"({(cur - prev) / prev * 100:+.2f}%)" if prev else ""
-        display_name = f"{key.split('_')[0]} {info.get('name','')}"
-        
-        if info['shares'] == 0:
-            p_jpy = 0
+    display_name = f"{key.split('_')[0]} {info.get('name','')}"
+
+    # --- 価格取得の成否を判定（NaN・取得失敗の両方をここで吸収する） ---
+    cur, prev = None, None
+    price_available = False
+    if p_data:
+        cur, prev = p_data.get("current"), p_data.get("prev_close")
+        if cur is not None and not pd.isna(cur):
+            price_available = True
+
+    day_change_pct = ""
+    if price_available and prev is not None and not pd.isna(prev) and prev != 0:
+        day_change_pct = f"({(cur - prev) / prev * 100:+.2f}%)"
+
+    if shares == 0:
+        p_jpy = 0
+        label = "決済済"
+    elif not price_available:
+        # 価格が取得できない銘柄は損益0円として扱い、合計に影響を与えない
+        p_jpy = 0
+        label = "信用(売建)" if "_SHORT" in key else ("信用(買建)" if "_MARGIN_LONG" in key else "現物")
+    else:
+        # --- [修正版] 損益計算ロジック ---
+        if "_SHORT" in key:
+            label = "信用(売建)"
+            diff = info['cost'] - cur
+        elif "_MARGIN_LONG" in key:
+            label = "信用(買建)"
+            diff = cur - info['cost']
         else:
-            # --- [修正版] 損益計算ロジック ---
-            if "_SHORT" in key:
-                label = "信用(売建)"
-                diff = info['cost'] - cur
-            elif "_MARGIN_LONG" in key:
-                label = "信用(買建)"
-                diff = cur - info['cost']
-            else:
-                label = "現物"
-                diff = cur - info['cost']
+            label = "現物"
+            diff = cur - info['cost']
 
-            if info.get('currency') == "USD":
-                p_usd = diff * info['shares']
-                p_jpy = p_usd * rate
-                total_profit_usd_only_us_stocks += p_usd
-            else:
-                p_jpy = diff * info['shares']
+        if info.get('currency') == "USD":
+            p_usd = diff * shares
+            p_jpy = p_usd * rate
+            total_profit_usd_only_us_stocks += p_usd
+        else:
+            p_jpy = diff * shares
+        # ---------------------------------
 
-            if info['shares'] == 0:
-                p_jpy = 0
+    total_profit_jpy += p_jpy
 
-            total_profit_jpy += p_jpy
-            # ---------------------------------
-        cost_display = f"${info['cost']:,}" if info.get('currency') == "USD" else f"¥{info['cost']:,}"
+    cost_display = f"${info['cost']:,}" if info.get('currency') == "USD" else f"¥{info['cost']:,}"
+    if shares == 0:
+        cur_display = "-"
+    elif price_available:
         cur_display = f"{('$' if info.get('currency') == 'USD' else '¥')}{cur:,.2f} {day_change_pct}"
-        
-        rows.append({
-            "No.": i + 1, "銘柄": display_name, "数量": info['shares'], "区分": label if info['shares'] > 0 else "決済済",
-            "取得単価": cost_display, "現在値 (前日比)": cur_display, "損益(円)": f"¥{p_jpy:,.0f}"
-        })
+    else:
+        cur_display = "⚠️ 価格取得失敗"
+
+    display_label = label if shares > 0 else "決済済"
+    if shares > 0 and not price_available:
+        display_label += "（未反映）"
+
+    rows.append({
+        "No.": i + 1, "銘柄": display_name, "数量": shares, "区分": display_label,
+        "取得単価": cost_display, "現在値 (前日比)": cur_display,
+        "損益(円)": f"¥{p_jpy:,.0f}" if (shares == 0 or price_available) else "¥0（未反映）"
+    })
 
 m_col1, m_col2 = st.columns(2)
 m_col1.metric("総合計損益 (JPY)", f"¥{total_profit_jpy:,.0f}", delta=f"USD/JPY: {rate:.2f}")
