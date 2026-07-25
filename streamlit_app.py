@@ -20,6 +20,13 @@ CONFIG_FILE = "config.json"
 # 【改修箇所】対象のスプレッドシートURLをここに記述してください
 FIXED_SHEET_URL = "https://docs.google.com/spreadsheets/d/17kAFl14q8EaaQ6kvezlAe1Yzr71Yo673T61--_cyESQ/edit"
 
+# --- バックアップ履歴 設定 ---
+MAX_BACKUPS = 1000          # 保持する最大バックアップ件数（超えたら古い順に削除）
+INITIAL_CACHE_SIZE = 10     # 初回「1つ前の設定」で読み込む件数（直近N件）
+WINDOW_CACHE_RADIUS = 10    # 範囲外アクセス時に読み込む前後件数（前後N件＝計2N件）
+TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S"       # スプレッドシート保存用の内部フォーマット
+DISPLAY_FMT = "%Y年%m月%d日 %H:%M"         # ユーザー表示用のフォーマット
+
 def load_json(file_path, default_value):
     if os.path.exists(file_path):
         try:
@@ -45,29 +52,127 @@ def get_gspread_client():
         st.error(f"Google認証に失敗しました: {e}")
         return None
 
+def ensure_header(ws):
+    """A1セルが 'timestamp' でなければヘッダー行を先頭に挿入する"""
+    try:
+        first_cell = ws.acell("A1").value
+    except Exception:
+        first_cell = None
+    if first_cell != "timestamp":
+        # 旧形式（A1に直接JSONを書いていた版）が残っている場合、
+        # そのままだと2行目に旧データが紛れ込みます。事前に手動でシートを
+        # クリアしておくことを推奨します。
+        ws.insert_row(["timestamp", "data"], 1)
+
+def get_backup_count(ws):
+    """タイムスタンプ列（A列）だけを読み、件数を安価に取得する"""
+    try:
+        col = ws.col_values(1)  # ヘッダー込み
+        return max(0, len(col) - 1)
+    except Exception:
+        return 0
+
+def fetch_backup_range(ws, start_idx, end_idx, total):
+    """
+    絶対インデックス start_idx〜end_idx（1=最古 … total=最新）の
+    範囲だけをまとめて取得する。
+    """
+    start_idx = max(1, start_idx)
+    end_idx = min(total, end_idx)
+    if start_idx > end_idx:
+        return {}, start_idx, end_idx
+
+    start_row = start_idx + 1  # +1 はヘッダー行分
+    end_row = end_idx + 1
+    values = ws.get(f"A{start_row}:B{end_row}")
+
+    cache = {}
+    for offset, row in enumerate(values):
+        idx = start_idx + offset
+        if len(row) >= 2 and row[1]:
+            try:
+                cache[idx] = {"timestamp": row[0], "data": json.loads(row[1])}
+            except Exception:
+                continue
+    return cache, start_idx, end_idx
+
 def export_to_spreadsheet(data):
+    """新規バックアップを1行追記する（上書きしない）。1000件超は古い順に削除。"""
     gc = get_gspread_client()
     if not gc: return
     try:
         sh = gc.open_by_url(FIXED_SHEET_URL)
         ws = sh.get_worksheet(0)
-        ws.clear()
-        ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
-        st.success("スプレッドシートへのエクスポートが完了しました")
+        ensure_header(ws)
+
+        timestamp = datetime.now().strftime(TIMESTAMP_FMT)
+        ws.append_row([timestamp, json.dumps(data, ensure_ascii=False)])
+
+        total = get_backup_count(ws)
+        if total > MAX_BACKUPS:
+            excess = total - MAX_BACKUPS
+            # 2行目（最古データ）から excess 件分をまとめて削除
+            ws.delete_rows(2, 1 + excess)
+
+        display_ts = datetime.strptime(timestamp, TIMESTAMP_FMT).strftime(DISPLAY_FMT)
+        st.success(f"バックアップを保存しました（{display_ts}）")
     except Exception as e:
         st.error(f"エクスポート失敗: {e}")
 
-def import_from_spreadsheet():
+def load_backup_window(center_idx=None, initial=False):
+    """
+    initial=True: 直近 INITIAL_CACHE_SIZE 件を読み込み、最新（=1つ前）を適用
+    initial=False: center_idx の前後 WINDOW_CACHE_RADIUS 件（計最大2N件）を読み込む
+    """
     gc = get_gspread_client()
-    if not gc: return None
+    if not gc: return
     try:
         sh = gc.open_by_url(FIXED_SHEET_URL)
         ws = sh.get_worksheet(0)
-        content = ws.acell('A1').value
-        return json.loads(content) if content else None
+        ensure_header(ws)
+
+        total = get_backup_count(ws)
+        st.session_state.backup_total = total
+        if total == 0:
+            st.warning("バックアップ履歴が見つかりません")
+            return
+
+        if initial:
+            start_idx = max(1, total - INITIAL_CACHE_SIZE + 1)
+            end_idx = total
+            target_idx = total  # 最新 = "1つ前"の最初の到達点
+        else:
+            start_idx = max(1, center_idx - WINDOW_CACHE_RADIUS)
+            end_idx = min(total, center_idx + WINDOW_CACHE_RADIUS)
+            target_idx = center_idx
+
+        cache, s, e = fetch_backup_range(ws, start_idx, end_idx, total)
+        if not cache:
+            st.warning("該当する履歴データが見つかりませんでした")
+            return
+
+        st.session_state.backup_cache = cache
+        st.session_state.cache_min = s
+        st.session_state.cache_max = e
+        apply_backup_index(target_idx)
     except Exception as e:
-        st.error(f"インポート失敗: {e}")
-        return None
+        st.error(f"履歴取得失敗: {e}")
+
+def apply_backup_index(idx):
+    """キャッシュ済みの idx 番目のバックアップをセッションに反映する"""
+    entry = st.session_state.backup_cache.get(idx)
+    if not entry:
+        st.warning("そのデータはまだキャッシュされていません")
+        return
+    backup_portfolio()
+    data = entry["data"]
+    st.session_state.portfolio = data.get("portfolio", {})
+    st.session_state.events = data.get("events", [])
+    st.session_state.reminder_text = data.get("reminder_text", "")
+    st.session_state.backup_index = idx
+    save_json(DB_FILE, st.session_state.portfolio)
+    save_json(EVENT_FILE, st.session_state.events)
+    save_json(REMINDER_FILE, st.session_state.reminder_text)
 
 # --- 1. セッション状態の初期化 ---
 if 'portfolio' not in st.session_state:
@@ -80,6 +185,17 @@ if 'reminder_text' not in st.session_state:
     st.session_state.reminder_text = load_json(REMINDER_FILE, "- ターゲット日程を入力してください")
 if 'api_key' not in st.session_state:
     st.session_state.api_key = load_json(CONFIG_FILE, {"gemini_key": ""}).get("gemini_key", "")
+# --- バックアップ履歴（前後移動）用の状態 ---
+if 'backup_cache' not in st.session_state:
+    st.session_state.backup_cache = {}      # {絶対インデックス: {"timestamp":..., "data":...}}
+if 'cache_min' not in st.session_state:
+    st.session_state.cache_min = None
+if 'cache_max' not in st.session_state:
+    st.session_state.cache_max = None
+if 'backup_index' not in st.session_state:
+    st.session_state.backup_index = None    # 現在表示中の絶対インデックス（1=最古）
+if 'backup_total' not in st.session_state:
+    st.session_state.backup_total = None
 
 # 復元用バックアップ
 def backup_portfolio():
@@ -257,21 +373,53 @@ with st.sidebar:
     st.subheader("💾 Backup (Spreadsheet)")
     full_config = {"portfolio": st.session_state.portfolio, "events": st.session_state.events, "reminder_text": st.session_state.reminder_text}
     
-    if st.button("設定をエクスポート"):
+    if st.button("設定をエクスポート（新規バックアップ）"):
         export_to_spreadsheet(full_config)
 
-    if st.button("設定をインポート"):
-        imported_data = import_from_spreadsheet()
-        if imported_data:
-            backup_portfolio()
-            st.session_state.portfolio = imported_data.get("portfolio", {})
-            st.session_state.events = imported_data.get("events", [])
-            st.session_state.reminder_text = imported_data.get("reminder_text", "")
-            save_json(DB_FILE, st.session_state.portfolio)
-            save_json(EVENT_FILE, st.session_state.events)
-            save_json(REMINDER_FILE, st.session_state.reminder_text)
-            st.success("インポート完了")
-            st.rerun()
+    # --- 前後ナビゲーション ---
+    nav_col1, nav_col2 = st.columns(2)
+    prev_clicked = nav_col1.button("◀ 1つ前の設定")
+    next_clicked = nav_col2.button("1つ後の設定 ▶")
+
+    if prev_clicked:
+        if st.session_state.backup_index is None:
+            # 初回：直近 INITIAL_CACHE_SIZE 件を読み込み、最新のものを表示
+            load_backup_window(initial=True)
+        else:
+            target = st.session_state.backup_index - 1
+            if target < 1:
+                st.warning("これ以上前の履歴はありません")
+            elif target < st.session_state.cache_min:
+                load_backup_window(center_idx=target)
+            else:
+                apply_backup_index(target)
+        st.rerun()
+
+    if next_clicked:
+        if st.session_state.backup_index is None:
+            st.info("先に「◀ 1つ前の設定」を押してください")
+        else:
+            total = st.session_state.backup_total or st.session_state.backup_index
+            target = st.session_state.backup_index + 1
+            if target > total:
+                st.warning("これより新しい履歴はありません（最新のバックアップです）")
+            elif target > st.session_state.cache_max:
+                load_backup_window(center_idx=target)
+            else:
+                apply_backup_index(target)
+        st.rerun()
+
+    # --- 現在表示中のバックアップ日時を表示 ---
+    if st.session_state.backup_index is not None:
+        entry = st.session_state.backup_cache.get(st.session_state.backup_index)
+        if entry:
+            try:
+                dt = datetime.strptime(entry["timestamp"], TIMESTAMP_FMT)
+                display_ts = dt.strftime(DISPLAY_FMT)
+            except Exception:
+                display_ts = entry["timestamp"]
+            total_disp = st.session_state.backup_total or "?"
+            st.caption(f"📅 表示中のバックアップ：**{display_ts}**（{st.session_state.backup_index} / {total_disp} 件目）")
 
     st.divider()
     st.header("📸 AI Scanner")
