@@ -207,6 +207,58 @@ if current_api_key:
     genai.configure(api_key=current_api_key)
 
 # --- 3. 解析・価格取得関数 ---
+def search_and_add_stock(query, add_type_label, shares, cost):
+    """
+    証券コード または 銘柄名 で検索し、見つかれば portfolio に新規追加する。
+    戻り値: 成功時は追加したキー文字列、失敗時は None
+    """
+    type_suffix = {"現物": "", "信用(買建)": "_MARGIN_LONG", "信用(売建)": "_SHORT"}.get(add_type_label, "")
+    q = query.strip()
+    if not q:
+        return None
+
+    candidates = []  # (表示コード, yfinanceティッカー, 通貨)
+    if q.isdigit() and len(q) == 4:
+        candidates.append((q, f"{q}.T", "JPY"))
+    candidates.append((q.upper(), q.upper(), "USD"))
+
+    # 1. コード直接指定として試す
+    for code, ticker, currency in candidates:
+        try:
+            info = yf.Ticker(ticker).info
+            name = info.get("shortName") or info.get("longName")
+            price = info.get("regularMarketPrice") or info.get("previousClose")
+            if name and price:
+                key = f"{code}{type_suffix}"
+                st.session_state.portfolio[key] = {
+                    "name": name, "shares": shares, "cost": cost, "currency": currency
+                }
+                return key
+        except Exception:
+            continue
+
+    # 2. 直接指定で見つからなければ、銘柄名によるあいまい検索
+    try:
+        search_result = yf.Search(q, max_results=5)
+        quotes = getattr(search_result, "quotes", []) or []
+        for item in quotes:
+            symbol = item.get("symbol")
+            name = item.get("shortname") or item.get("longname")
+            if not symbol:
+                continue
+            is_japan = symbol.endswith(".T")
+            code = symbol.replace(".T", "") if is_japan else symbol
+            currency = "JPY" if is_japan else "USD"
+            key = f"{code}{type_suffix}"
+            st.session_state.portfolio[key] = {
+                "name": name or code, "shares": shares, "cost": cost, "currency": currency
+            }
+            return key
+    except Exception:
+        pass
+
+    return None
+
 def get_live_prices(portfolio_keys):
     prices = {}
     for key in portfolio_keys:
@@ -299,26 +351,54 @@ with st.sidebar:
     st.divider()
 
     st.header("✏️ 銘柄情報の直接入力")
-    portfolio_items = list(st.session_state.portfolio.keys())
-    selected_no = None
-    if portfolio_items:
-        no_options = [i + 1 for i in range(len(portfolio_items))]
-        selected_no = st.selectbox("銘柄No.を選択", options=no_options)
-        target_key = portfolio_items[selected_no - 1]
-        target_info = st.session_state.portfolio[target_key]
-        new_shares = st.number_input(f"数量 ({target_key})", value=float(target_info.get('shares', 0)))
-        new_cost = st.number_input(f"取得単価 ({target_key})", value=float(target_info.get('cost', 0)))
+
+    new_symbol_query = st.text_input(
+        "🔍 銘柄コード/名称で新規追加（入力時のみ有効）",
+        value="", key="add_stock_query",
+        placeholder="例：7203 / NVDA / トヨタ"
+    )
+    add_mode = bool(new_symbol_query.strip())
+
+    if add_mode:
+        add_type = st.selectbox("区分", ["現物", "信用(買建)", "信用(売建)"], key="add_stock_type")
+        new_shares = st.number_input("数量（新規）", value=0.0, min_value=0.0, key="add_stock_shares")
+        new_cost = st.number_input("取得単価（新規）", value=0.0, min_value=0.0, key="add_stock_cost")
+        selected_no = None
+        target_key = None
     else:
-        st.info("編集する銘柄がありません")
-        new_shares, new_cost = 0.0, 0.0
+        portfolio_items = list(st.session_state.portfolio.keys())
+        selected_no = None
+        if portfolio_items:
+            no_options = [i + 1 for i in range(len(portfolio_items))]
+            selected_no = st.selectbox("銘柄No.を選択", options=no_options)
+            target_key = portfolio_items[selected_no - 1]
+            target_info = st.session_state.portfolio[target_key]
+            new_shares = st.number_input(f"数量 ({target_key})", value=float(target_info.get('shares', 0)))
+            new_cost = st.number_input(f"取得単価 ({target_key})", value=float(target_info.get('cost', 0)))
+        else:
+            st.info("編集する銘柄がありません")
+            new_shares, new_cost = 0.0, 0.0
+            target_key = None
 
     btn_col1, btn_col2, btn_col3 = st.columns(3)
     mod_ready = btn_col1.button("修正")
     rev_ready = btn_col2.button("復元", type="primary")
     del_ready = btn_col3.button("削除")
 
-    if selected_no:
-        if mod_ready:
+    if mod_ready:
+        if add_mode:
+            with st.spinner(f"「{new_symbol_query}」を検索中..."):
+                backup_portfolio()
+                added_key = search_and_add_stock(new_symbol_query, add_type, new_shares, new_cost)
+            if added_key:
+                save_json(DB_FILE, st.session_state.portfolio)
+                st.success(f"銘柄「{added_key}」を追加しました")
+                del st.session_state["add_stock_query"]
+                st.rerun()
+            else:
+                st.session_state.prev_portfolio = None  # 追加失敗時はバックアップを取り消す
+                st.error(f"「{new_symbol_query}」に該当する銘柄が見つかりませんでした")
+        elif selected_no:
             backup_portfolio()
             if new_shares == 0:
                 st.session_state.portfolio[target_key]['shares'] = 0
@@ -329,16 +409,19 @@ with st.sidebar:
             save_json(DB_FILE, st.session_state.portfolio)
             st.rerun()
 
-        if rev_ready:
-            if st.session_state.prev_portfolio is not None:
-                st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
-                st.session_state.prev_portfolio = None
-                save_json(DB_FILE, st.session_state.portfolio)
-                st.rerun()
-            else:
-                st.error("復元できる履歴がありません")
+    if rev_ready:
+        if st.session_state.prev_portfolio is not None:
+            st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
+            st.session_state.prev_portfolio = None
+            save_json(DB_FILE, st.session_state.portfolio)
+            st.rerun()
+        else:
+            st.error("復元できる履歴がありません")
 
-        if del_ready:
+    if del_ready:
+        if add_mode:
+            st.warning("削除は既存銘柄を選択している場合のみ有効です")
+        elif selected_no:
             backup_portfolio()
             del st.session_state.portfolio[target_key]
             save_json(DB_FILE, st.session_state.portfolio)
