@@ -96,6 +96,46 @@ def fetch_backup_range(ws, start_idx, end_idx, total):
                 continue
     return cache, start_idx, end_idx
 
+def overwrite_backup_at_index(idx, data):
+    """
+    絶対インデックス idx の行を、新しい内容で上書きする。
+    - 主：セッションに保持している idx（=行番号-1）から直接特定
+    - 副：上書き直前に実際のタイムスタンプとキャッシュ上のタイムスタンプを照合し、
+          ズレていれば列A全体を検索してフォールバックする
+    戻り値: 成功時は書き込んだ行のタイムスタンプ文字列、失敗時は None
+    """
+    gc = get_gspread_client()
+    if not gc: return None
+    try:
+        sh = gc.open_by_url(FIXED_SHEET_URL)
+        ws = sh.get_worksheet(0)
+        ensure_header(ws)
+
+        cached_entry = st.session_state.backup_cache.get(idx)
+        expected_ts = cached_entry["timestamp"] if cached_entry else None
+        row_number = idx + 1  # +1 はヘッダー行分
+
+        actual_row = ws.row_values(row_number)
+        actual_ts = actual_row[0] if actual_row else None
+
+        if expected_ts and actual_ts != expected_ts:
+            # 行がズレている可能性 → タイムスタンプで再検索してフォールバック
+            col = ws.col_values(1)
+            try:
+                row_number = col.index(expected_ts) + 1  # 1-based行番号（col[0]がヘッダー）
+            except ValueError:
+                st.error("上書き対象のバックアップがシート上に見つかりませんでした（削除された可能性があります）。"
+                          "「◀ 1つ前の設定」で対象を読み込み直してください。")
+                return None
+
+        # タイムスタンプは維持したまま、データ部分のみ上書きする
+        keep_ts = expected_ts or actual_ts or datetime.now().strftime(TIMESTAMP_FMT)
+        ws.update(f"A{row_number}:B{row_number}", [[keep_ts, json.dumps(data, ensure_ascii=False)]])
+        return keep_ts
+    except Exception as e:
+        st.error(f"上書き失敗: {e}")
+        return None
+
 def export_to_spreadsheet(data):
     """新規バックアップを1行追記する（上書きしない）。1000件超は古い順に削除。"""
     gc = get_gspread_client()
@@ -456,8 +496,28 @@ with st.sidebar:
     st.subheader("💾 Backup (Spreadsheet)")
     full_config = {"portfolio": st.session_state.portfolio, "events": st.session_state.events, "reminder_text": st.session_state.reminder_text}
     
-    if st.button("設定をエクスポート（新規バックアップ）"):
+    exp_col1, exp_col2 = st.columns(2)
+    new_backup_clicked = exp_col1.button("🆕 新規バックアップ")
+    overwrite_clicked = exp_col2.button("♻️ 上書きバックアップ")
+
+    if new_backup_clicked:
         export_to_spreadsheet(full_config)
+
+    if overwrite_clicked:
+        if st.session_state.backup_index is None:
+            st.warning("上書き対象が選択されていません。先に「◀ 1つ前の設定」で対象のバックアップを表示してください。")
+        else:
+            written_ts = overwrite_backup_at_index(st.session_state.backup_index, full_config)
+            if written_ts:
+                # ローカルキャッシュも同時に更新しておく（表示との整合性を保つため）
+                entry = st.session_state.backup_cache.get(st.session_state.backup_index)
+                if entry:
+                    entry["data"] = full_config
+                try:
+                    display_ts = datetime.strptime(written_ts, TIMESTAMP_FMT).strftime(DISPLAY_FMT)
+                except Exception:
+                    display_ts = written_ts
+                st.success(f"バックアップを上書きしました（{display_ts}）")
 
     # --- 前後ナビゲーション ---
     nav_col1, nav_col2 = st.columns(2)
