@@ -44,7 +44,7 @@ def save_json(file_path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 # --- Google Spreadsheet 連携関数 ---
-def get_gspread_client():
+def get_gspread_client(silent=False):
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     try:
         # Streamlit secrets または環境変数から認証情報を取得
@@ -52,7 +52,8 @@ def get_gspread_client():
         credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         return gspread.authorize(credentials)
     except Exception as e:
-        st.error(f"Google認証に失敗しました: {e}")
+        if not silent:
+            st.error(f"Google認証に失敗しました: {e}")
         return None
 
 def ensure_header(ws):
@@ -162,6 +163,36 @@ def export_to_spreadsheet(data):
     except Exception as e:
         st.error(f"エクスポート失敗: {e}")
 
+def preload_backup_cache():
+    """
+    アプリ起動時に一度だけ呼び出す。直近 INITIAL_CACHE_SIZE 件を先読みして
+    キャッシュしておくことで、初回の「1つ前の設定」操作をAPI呼び出しなしで
+    即座に反映できるようにする。ライブの portfolio には一切手を加えない。
+    """
+    gc = get_gspread_client(silent=True)  # 未設定環境でも起動時にエラーを出さない
+    if not gc:
+        return
+    try:
+        sh = gc.open_by_url(FIXED_SHEET_URL)
+        ws = sh.get_worksheet(0)
+        ensure_header(ws)
+
+        total = get_backup_count(ws)
+        st.session_state.backup_total = total
+        if total == 0:
+            return
+
+        start_idx = max(1, total - INITIAL_CACHE_SIZE + 1)
+        cache, s, e = fetch_backup_range(ws, start_idx, total, total)
+        if cache:
+            st.session_state.backup_cache = cache
+            st.session_state.cache_min = s
+            st.session_state.cache_max = e
+    except Exception:
+        # 起動時のプリロードはあくまで先読み最適化のためのものなので、
+        # 失敗してもアプリ本体の起動は妨げない（黙って諦める）
+        pass
+
 def load_backup_window(center_idx=None, initial=False):
     """
     initial=True: 直近 INITIAL_CACHE_SIZE 件を読み込み、最新（=1つ前）を適用
@@ -239,6 +270,13 @@ if 'backup_index' not in st.session_state:
     st.session_state.backup_index = None    # 現在表示中の絶対インデックス（1=最古）
 if 'backup_total' not in st.session_state:
     st.session_state.backup_total = None
+if 'startup_backup_preloaded' not in st.session_state:
+    st.session_state.startup_backup_preloaded = False
+
+if not st.session_state.startup_backup_preloaded:
+    # アプリ起動時に一度だけ、直近のバックアップ履歴を先読みしてキャッシュしておく
+    preload_backup_cache()
+    st.session_state.startup_backup_preloaded = True
 
 # 復元用バックアップ
 def backup_portfolio():
@@ -640,8 +678,12 @@ with st.sidebar:
 
     if prev_clicked:
         if st.session_state.backup_index is None:
-            # 初回：直近 INITIAL_CACHE_SIZE 件を読み込み、最新のものを表示
-            load_backup_window(initial=True)
+            if st.session_state.cache_min is not None and st.session_state.backup_total:
+                # 起動時にプリロード済みのキャッシュをそのまま使う（API呼び出し不要）
+                apply_backup_index(st.session_state.backup_total)
+            else:
+                # プリロードが未実施・失敗していた場合のフォールバック
+                load_backup_window(initial=True)
         else:
             target = st.session_state.backup_index - 1
             if target < 1:
