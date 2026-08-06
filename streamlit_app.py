@@ -12,6 +12,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import csv
 from streamlit_autorefresh import st_autorefresh
+import streamlit.components.v1 as components
 
 # --- 0. データの保存・読み込み ---
 DB_FILE = "portfolio.json"
@@ -457,6 +458,40 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# --- キーボードショートカット（← → で バックアップ履歴を前後に移動） ---
+components.html("""
+<script>
+(function() {
+    const doc = window.parent.document;
+    // 複数回のrerunでリスナーが重複登録されるのを防ぐためのフラグ
+    if (doc.__backupNavKeyListenerInstalled) { return; }
+    doc.__backupNavKeyListenerInstalled = true;
+
+    function clickButtonByText(text) {
+        const buttons = Array.from(doc.querySelectorAll('button'));
+        const target = buttons.find(btn => btn.innerText.trim() === text);
+        if (target) { target.click(); }
+    }
+
+    doc.addEventListener('keydown', function(e) {
+        const active = doc.activeElement;
+        const tag = active ? active.tagName.toLowerCase() : '';
+        // 入力欄にフォーカスがある間は矢印キー本来の動作（カーソル移動等）を妨げない
+        if (tag === 'input' || tag === 'textarea' || (active && active.isContentEditable)) {
+            return;
+        }
+        if (e.key === 'ArrowRight') {
+            clickButtonByText('1つ後の設定 ▶');
+            e.preventDefault();
+        } else if (e.key === 'ArrowLeft') {
+            clickButtonByText('◀ 1つ前の設定');
+            e.preventDefault();
+        }
+    });
+})();
+</script>
+""", height=0)
 
 with st.sidebar:
     st.header("🔑 Settings")
