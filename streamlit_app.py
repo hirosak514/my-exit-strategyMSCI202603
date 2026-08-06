@@ -14,6 +14,7 @@ import csv
 from streamlit_autorefresh import st_autorefresh
 import streamlit.components.v1 as components
 import time
+import requests
 
 # --- 0. データの保存・読み込み ---
 DB_FILE = "portfolio.json"
@@ -268,6 +269,8 @@ if 'reminder_text' not in st.session_state:
     st.session_state.reminder_text = load_json(REMINDER_FILE, "- ターゲット日程を入力してください")
 if 'api_key' not in st.session_state:
     st.session_state.api_key = load_json(CONFIG_FILE, {"gemini_key": ""}).get("gemini_key", "")
+if 'twelvedata_key' not in st.session_state:
+    st.session_state.twelvedata_key = load_json(CONFIG_FILE, {}).get("twelvedata_key", "")
 # --- バックアップ履歴（前後移動）用の状態 ---
 if 'backup_cache' not in st.session_state:
     st.session_state.backup_cache = {}      # {絶対インデックス: {"timestamp":..., "data":...}}
@@ -295,6 +298,8 @@ def backup_portfolio():
 current_api_key = st.session_state.api_key or st.secrets.get("GEMINI_API_KEY", "")
 if current_api_key:
     genai.configure(api_key=current_api_key)
+
+current_twelvedata_key = st.session_state.twelvedata_key or st.secrets.get("TWELVEDATA_API_KEY", "")
 
 # --- 3. 解析・価格取得関数 ---
 def search_and_add_stock(query, add_type_label, shares, cost):
@@ -408,12 +413,102 @@ def build_entries_from_csv(rows, default_shares=100):
         }
     return entries
 
-def get_live_prices(portfolio_keys):
+TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
+
+def build_twelvedata_symbol(portfolio_key):
+    """内部の portfolio キー（例: '7203_現物'）から Twelve Data 用のシンボル文字列を作る"""
+    code = portfolio_key.split('_')[0]
+    is_japan = code.isdigit() and len(code) == 4
+    if code == "IHI":
+        return "7013:TSE"
+    if is_japan:
+        return f"{code}:TSE"
+    return code.upper()
+
+def fetch_twelvedata_quotes(portfolio_keys, api_key):
+    """
+    Twelve Data の /quote エンドポイントで複数銘柄をまとめて取得する。
+    戻り値: {portfolio_key: {"current":..., "prev_close":...}} （取得できたものだけを含む）
+    取得できなかった銘柄はこの戻り値に含まれないので、呼び出し元でYahooにフォールバックする。
+    """
+    if not api_key or not portfolio_keys:
+        return {}
+
+    key_to_symbol = {k: build_twelvedata_symbol(k) for k in portfolio_keys}
+    symbol_to_keys = {}
+    for k, sym in key_to_symbol.items():
+        symbol_to_keys.setdefault(sym, []).append(k)
+
+    symbols = list(symbol_to_keys.keys())
+    results = {}
+
+    CHUNK = 100  # Twelve Dataは1リクエストあたり最大120銘柄まで対応（余裕を持たせる）
+    for i in range(0, len(symbols), CHUNK):
+        chunk_symbols = symbols[i:i + CHUNK]
+        params = {"symbol": ",".join(chunk_symbols), "apikey": api_key}
+        try:
+            resp = requests.get(f"{TWELVEDATA_BASE_URL}/quote", params=params, timeout=10)
+            data = resp.json()
+        except Exception:
+            continue  # このチャンクは全滅 → 呼び出し元でYahooにフォールバックされる
+
+        # 単一銘柄の場合は結果がそのままdictで返り、複数銘柄の場合はsymbolをキーにしたdict of dictで返る
+        if isinstance(data, dict) and "symbol" in data:
+            entries = {data.get("symbol"): data}
+        elif isinstance(data, dict):
+            entries = data
+        else:
+            entries = {}
+
+        for sym, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") == "error" or "close" not in entry:
+                continue
+            try:
+                cur = float(entry["close"])
+            except (TypeError, ValueError):
+                continue
+            prev = entry.get("previous_close")
+            try:
+                prev = float(prev) if prev is not None else None
+            except (TypeError, ValueError):
+                prev = None
+
+            matched_keys = symbol_to_keys.get(sym)
+            if not matched_keys:
+                # レスポンスのsymbol表記が微妙に異なる場合（例: "7203:TSE" vs "7203"）への保険
+                base = str(sym).split(':')[0]
+                for cand_sym, ks in symbol_to_keys.items():
+                    if cand_sym.split(':')[0] == base:
+                        matched_keys = ks
+                        break
+            if matched_keys:
+                for k in matched_keys:
+                    results[k] = {"current": cur, "prev_close": prev}
+
+    return results
+
+def get_live_prices(portfolio_keys, td_api_key=None):
     prices = {}
     fetch_errors = {}   # デバッグ用：銘柄ごとの失敗理由を記録
     fetch_debug = {}    # デバッグ用：成功時も含め、取得元・値を記録
+    portfolio_keys = list(portfolio_keys)
+
+    # --- 0. まず Twelve Data でまとめて取得を試す（設定されている場合のみ） ---
+    td_results = {}
+    if td_api_key:
+        try:
+            td_results = fetch_twelvedata_quotes(portfolio_keys, td_api_key)
+        except Exception as e:
+            fetch_errors["_twelvedata"] = f"{type(e).__name__}: {e}"
 
     for key in portfolio_keys:
+        if key in td_results:
+            prices[key] = td_results[key]
+            fetch_debug[key] = f"[twelvedata] 現在値={td_results[key]['current']} 前日終値={td_results[key]['prev_close']}"
+            continue  # Twelve Dataで取得できた銘柄はYahooに問い合わせない
+
         symbol = key.split('_')[0]
         is_japan = symbol.isdigit() and len(symbol) == 4
         ticker = f"{symbol}.T" if is_japan else ("7013.T" if symbol == "IHI" else symbol)
@@ -498,38 +593,52 @@ def get_live_prices(portfolio_keys):
 
         time.sleep(0.3)  # .info は複数リクエストが飛ぶ重い呼び出しのため、間隔を少し長めに
 
-    try:
-        usdjpy_md = yf.Ticker("JPY=X").get_history_metadata()
-        prices["USDJPY"] = usdjpy_md.get("regularMarketPrice", 159.2) if usdjpy_md else 159.2
-    except Exception:
+    # --- USD/JPY為替レートもTwelve Data優先、ダメならYahooにフォールバック ---
+    usdjpy_from_td = None
+    if td_api_key:
         try:
-            usdjpy = yf.Ticker("JPY=X").history(period="5d")
-            prices["USDJPY"] = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
+            resp = requests.get(f"{TWELVEDATA_BASE_URL}/quote", params={"symbol": "USD/JPY", "apikey": td_api_key}, timeout=10)
+            fx_data = resp.json()
+            if isinstance(fx_data, dict) and fx_data.get("status") != "error" and "close" in fx_data:
+                usdjpy_from_td = float(fx_data["close"])
         except Exception as e:
-            prices["USDJPY"] = 159.2
-            fetch_errors["USDJPY"] = f"{type(e).__name__}: {e}"
+            fetch_errors["USDJPY"] = f"[twelvedata] {type(e).__name__}: {e}"
+
+    if usdjpy_from_td is not None:
+        prices["USDJPY"] = usdjpy_from_td
+    else:
+        try:
+            usdjpy_md = yf.Ticker("JPY=X").get_history_metadata()
+            prices["USDJPY"] = usdjpy_md.get("regularMarketPrice", 159.2) if usdjpy_md else 159.2
+        except Exception:
+            try:
+                usdjpy = yf.Ticker("JPY=X").history(period="5d")
+                prices["USDJPY"] = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
+            except Exception as e:
+                prices["USDJPY"] = 159.2
+                fetch_errors["USDJPY"] = fetch_errors.get("USDJPY", "") + f" / {type(e).__name__}: {e}"
 
     prices["_fetch_errors"] = fetch_errors
     prices["_fetch_debug"] = fetch_debug
     return prices
 
-PRICE_CACHE_TTL_SECONDS = 300  # 5分
+PRICE_CACHE_TTL_SECONDS = 900  # 15分
 
 @st.cache_data(ttl=PRICE_CACHE_TTL_SECONDS, show_spinner=False)
-def _fetch_prices_cached(keys_tuple):
-    """get_live_prices の結果を5分間キャッシュする。取得時刻も併せて返す。"""
-    prices = get_live_prices(list(keys_tuple))
+def _fetch_prices_cached(keys_tuple, td_api_key):
+    """get_live_prices の結果を15分間キャッシュする。取得時刻も併せて返す。"""
+    prices = get_live_prices(list(keys_tuple), td_api_key=td_api_key)
     return prices, now_jst()
 
-def get_prices_with_cache(portfolio_keys):
+def get_prices_with_cache(portfolio_keys, td_api_key=None):
     """
-    ポートフォリオのキー集合から価格を取得する（5分キャッシュ付き）。
+    ポートフォリオのキー集合から価格を取得する（15分キャッシュ付き）。
     戻り値: (prices_dict, last_updated_datetime)
     """
     keys_tuple = tuple(sorted(portfolio_keys))
     if not keys_tuple:
         return {"USDJPY": 159.2}, now_jst()
-    return _fetch_prices_cached(keys_tuple)
+    return _fetch_prices_cached(keys_tuple, td_api_key)
 
 # 【オリジナルを完全踏襲】
 def analyze_multiple_images(uploaded_files):
@@ -646,8 +755,20 @@ with st.sidebar:
     new_api_key = st.text_input("Gemini API Key", value=st.session_state.api_key, type="password")
     if st.button("APIキーを保存"):
         st.session_state.api_key = new_api_key
-        save_json(CONFIG_FILE, {"gemini_key": new_api_key})
+        cfg = load_json(CONFIG_FILE, {})
+        cfg["gemini_key"] = new_api_key
+        save_json(CONFIG_FILE, cfg)
         st.success("APIキーを保存しました")
+        st.rerun()
+
+    new_td_key = st.text_input("Twelve Data API Key", value=st.session_state.twelvedata_key, type="password",
+                                help="株価取得の第一候補として使用します。未設定・取得失敗時はYahoo Financeにフォールバックします。")
+    if st.button("Twelve Data APIキーを保存"):
+        st.session_state.twelvedata_key = new_td_key
+        cfg = load_json(CONFIG_FILE, {})
+        cfg["twelvedata_key"] = new_td_key
+        save_json(CONFIG_FILE, cfg)
+        st.success("Twelve Data APIキーを保存しました")
         st.rerun()
 
     st.divider()
@@ -886,7 +1007,7 @@ st.title("🚀 Strategist Dashboard")
 # 【改修１】Portfolio Monitor を最上部に配置
 st.header("📉 Portfolio Monitor")
 
-# 5分（300,000ミリ秒）ごとに自動で画面を再実行する
+# 15分（900,000ミリ秒）ごとに自動で画面を再実行する
 st_autorefresh(interval=PRICE_CACHE_TTL_SECONDS * 1000, key="auto_price_refresh")
 
 def simulate_equal_investment(total_amount, input_currency, prices_dict, rate):
@@ -941,8 +1062,8 @@ if col_refresh.button('最新価格に更新'):
     _fetch_prices_cached.clear()
     st.rerun()
 
-prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys())
-col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（5分ごとに自動更新）")
+prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys(), td_api_key=current_twelvedata_key)
+col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（15分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
 
 # --- 価格取得エラーの診断表示（原因調査用） ---

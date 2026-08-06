@@ -1,0 +1,9 @@
+streamlit
+streamlit-autorefresh
+yfinance
+pandas
+google-generativeai
+Pillow
+gspread
+google-auth
+requests
