@@ -419,23 +419,41 @@ def get_live_prices(portfolio_keys):
         ticker = f"{symbol}.T" if is_japan else ("7013.T" if symbol == "IHI" else symbol)
 
         got_price = False
+
+        # --- 1. get_history_metadata() の regularMarketPrice を最優先で試す ---
+        # (fast_info.last_price は内部的に history() の日足終値をそのまま使っているだけで、
+        #  実は取引時間中でも更新されないことが判明。regularMarketPrice は
+        #  Yahoo Financeが返す実際の気配値そのものなので、こちらが本当の「現在値」)
         try:
-            # --- 1. まず fast_info でリアルタイムに近い気配値を試す ---
-            # (history()の日足は、その日の足が確定するまで前日終値のままになるため、
-            #  取引時間中の「現在値」としては不向き)
             stock = yf.Ticker(ticker)
-            fi = stock.fast_info
-            cur = fi.get("lastPrice") if fi else None
-            prev = fi.get("previousClose") if fi else None
+            md = stock.get_history_metadata()
+            cur = md.get("regularMarketPrice") if md else None
+            prev = md.get("chartPreviousClose") if md else None
+            if prev is None and md:
+                prev = md.get("previousClose")
             if cur is not None and not pd.isna(cur):
                 prices[key] = {"current": cur, "prev_close": prev}
-                fetch_debug[key] = f"[fast_info] 現在値={cur:.2f} 前日終値={prev}"
+                fetch_debug[key] = f"[metadata] 現在値={cur} 前日終値={prev}"
                 got_price = True
         except Exception as e:
-            fetch_errors[key] = f"[fast_info] {type(e).__name__}: {e}"
+            fetch_errors[key] = f"[metadata] {type(e).__name__}: {e}"
 
         if not got_price:
-            # --- 2. fast_info が使えない場合は、従来の日足取得にフォールバック ---
+            # --- 2. metadataが使えない場合は fast_info を試す ---
+            try:
+                stock = yf.Ticker(ticker)
+                fi = stock.fast_info
+                cur = fi.get("lastPrice") if fi else None
+                prev = fi.get("previousClose") if fi else None
+                if cur is not None and not pd.isna(cur):
+                    prices[key] = {"current": cur, "prev_close": prev}
+                    fetch_debug[key] = f"[fast_info] 現在値={cur:.2f} 前日終値={prev}"
+                    got_price = True
+            except Exception as e:
+                fetch_errors[key] = fetch_errors.get(key, "") + f" / [fast_info] {type(e).__name__}: {e}"
+
+        if not got_price:
+            # --- 3. それでもダメなら従来の日足取得にフォールバック ---
             try:
                 stock = yf.Ticker(ticker)
                 hist = stock.history(period="5d")
@@ -458,8 +476,8 @@ def get_live_prices(portfolio_keys):
         time.sleep(0.15)  # 連続リクエストによるレート制限を避けるための小休止
 
     try:
-        usdjpy_fi = yf.Ticker("JPY=X").fast_info
-        prices["USDJPY"] = usdjpy_fi.get("lastPrice", 159.2) if usdjpy_fi else 159.2
+        usdjpy_md = yf.Ticker("JPY=X").get_history_metadata()
+        prices["USDJPY"] = usdjpy_md.get("regularMarketPrice", 159.2) if usdjpy_md else 159.2
     except Exception:
         try:
             usdjpy = yf.Ticker("JPY=X").history(period="5d")
