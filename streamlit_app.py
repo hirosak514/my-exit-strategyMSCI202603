@@ -11,6 +11,7 @@ import copy
 import gspread
 from google.oauth2.service_account import Credentials
 import csv
+from streamlit_autorefresh import st_autorefresh
 
 # --- 0. データの保存・読み込み ---
 DB_FILE = "portfolio.json"
@@ -386,6 +387,24 @@ def get_live_prices(portfolio_keys):
         prices["USDJPY"] = 159.2
     return prices
 
+PRICE_CACHE_TTL_SECONDS = 300  # 5分
+
+@st.cache_data(ttl=PRICE_CACHE_TTL_SECONDS, show_spinner=False)
+def _fetch_prices_cached(keys_tuple):
+    """get_live_prices の結果を5分間キャッシュする。取得時刻も併せて返す。"""
+    prices = get_live_prices(list(keys_tuple))
+    return prices, datetime.now()
+
+def get_prices_with_cache(portfolio_keys):
+    """
+    ポートフォリオのキー集合から価格を取得する（5分キャッシュ付き）。
+    戻り値: (prices_dict, last_updated_datetime)
+    """
+    keys_tuple = tuple(sorted(portfolio_keys))
+    if not keys_tuple:
+        return {"USDJPY": 159.2}, datetime.now()
+    return _fetch_prices_cached(keys_tuple)
+
 # 【オリジナルを完全踏襲】
 def analyze_multiple_images(uploaded_files):
     if not current_api_key:
@@ -679,9 +698,18 @@ st.title("🚀 Strategist Dashboard")
 
 # 【改修１】Portfolio Monitor を最上部に配置
 st.header("📉 Portfolio Monitor")
-if st.button('最新価格に更新'): st.rerun()
 
-prices_dict = get_live_prices(st.session_state.portfolio.keys())
+# 5分（300,000ミリ秒）ごとに自動で画面を再実行する
+st_autorefresh(interval=PRICE_CACHE_TTL_SECONDS * 1000, key="auto_price_refresh")
+
+col_refresh, col_ts = st.columns([1, 3])
+if col_refresh.button('最新価格に更新'):
+    # キャッシュを明示的に破棄してから再実行（手動更新は必ず最新値を取りに行く）
+    _fetch_prices_cached.clear()
+    st.rerun()
+
+prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys())
+col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（5分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
 
 rows = []
