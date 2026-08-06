@@ -10,6 +10,7 @@ import os
 import copy
 import gspread
 from google.oauth2.service_account import Credentials
+import csv
 
 # --- 0. データの保存・読み込み ---
 DB_FILE = "portfolio.json"
@@ -299,6 +300,65 @@ def search_and_add_stock(query, add_type_label, shares, cost):
 
     return None
 
+def parse_stock_csv(uploaded_file):
+    """
+    1行目が '#' で始まるコメント行（例: # トレンド銘柄...,保存日時:...,市場:jp）の場合はスキップし、
+    'code,name' ヘッダーを持つCSVから銘柄コード・銘柄名のリストを抽出する。
+    戻り値: [(code, name), ...]
+    """
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        text = raw.decode('shift_jis', errors='ignore')
+
+    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith('#')]
+    if not lines:
+        return []
+
+    reader = csv.DictReader(lines)
+    # ヘッダーの大文字小文字・前後空白ゆれを吸収
+    fieldmap = {(f or '').strip().lower(): f for f in (reader.fieldnames or [])}
+    code_field = fieldmap.get('code')
+    name_field = fieldmap.get('name')
+
+    results = []
+    for row in reader:
+        code = (row.get(code_field) or '').strip() if code_field else ''
+        name = (row.get(name_field) or '').strip() if name_field else ''
+        if code:
+            results.append((code, name))
+    return results
+
+def build_entries_from_csv(rows, default_shares=100):
+    """
+    [(code, name), ...] から portfolio 用のエントリ辞書を作る。
+    価格は現在株価を自動取得（取得できない場合は0）。区分は「現物」固定。
+    """
+    entries = {}
+    for code, name in rows:
+        is_japan = code.isdigit() and len(code) == 4
+        ticker = f"{code}.T" if is_japan else ("7013.T" if code == "IHI" else code.upper())
+        currency = "JPY" if is_japan else "USD"
+
+        price = 0.0
+        try:
+            hist = yf.Ticker(ticker).history(period="5d")
+            if not hist.empty:
+                price = float(hist['Close'].iloc[-1])
+        except Exception:
+            price = 0.0
+
+        key = f"{code}_現物"
+        entries[key] = {
+            "name": name or code,
+            "shares": default_shares,
+            "cost": round(price, 2),
+            "currency": currency
+        }
+    return entries
+
 def get_live_prices(portfolio_keys):
     prices = {}
     for key in portfolio_keys:
@@ -563,6 +623,39 @@ with st.sidebar:
                 display_ts = entry["timestamp"]
             total_disp = st.session_state.backup_total or "?"
             st.caption(f"📅 表示中のバックアップ：**{display_ts}**（{st.session_state.backup_index} / {total_disp} 件目）")
+
+    st.divider()
+    st.header("📄 CSV読み込み")
+    csv_file = st.file_uploader(
+        "銘柄リストCSVをアップロード（ドラッグ&ドロップ可）",
+        type=["csv"], key="csv_uploader"
+    )
+    csv_mode = st.radio(
+        "読み込み方法",
+        ["現在の画面に追加", "新規リストとして作成（既存を置き換え）"],
+        key="csv_mode"
+    )
+    if st.button("csv読み込み"):
+        if csv_file:
+            with st.spinner("CSVを解析し、現在株価を取得中..."):
+                try:
+                    rows = parse_stock_csv(csv_file)
+                    if not rows:
+                        st.warning("CSVから銘柄を読み取れませんでした。フォーマットをご確認ください。")
+                    else:
+                        new_entries = build_entries_from_csv(rows, default_shares=100)
+                        backup_portfolio()
+                        if csv_mode == "現在の画面に追加":
+                            st.session_state.portfolio.update(new_entries)
+                        else:
+                            st.session_state.portfolio = new_entries
+                        save_json(DB_FILE, st.session_state.portfolio)
+                        st.success(f"{len(new_entries)}件の銘柄を読み込みました")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"CSV読み込みエラー: {e}")
+        else:
+            st.warning("CSVファイルがアップロードされていません。")
 
     st.divider()
     st.header("📸 AI Scanner")
