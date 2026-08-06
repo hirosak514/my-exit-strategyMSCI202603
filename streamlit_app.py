@@ -702,7 +702,53 @@ st.header("📉 Portfolio Monitor")
 # 5分（300,000ミリ秒）ごとに自動で画面を再実行する
 st_autorefresh(interval=PRICE_CACHE_TTL_SECONDS * 1000, key="auto_price_refresh")
 
-col_refresh, col_ts = st.columns([1, 3])
+def simulate_equal_investment(total_amount, input_currency, prices_dict, rate):
+    """
+    現在のポートフォリオ銘柄に、投資金額を均等配分する。
+    - 投資額はJPY基準に変換した上で銘柄数で等分する
+    - 各銘柄は自国通貨に変換し、現在株価で1株単位（切り捨て）の株数を算出する
+    戻り値: (success, {key: shares} または None, 必要最低金額(入力通貨換算) または 0)
+    """
+    keys = list(st.session_state.portfolio.keys())
+    if not keys:
+        return False, None, 0
+
+    # 現在価格を取得できた銘柄のみを対象にする
+    valid_entries = {}
+    for key in keys:
+        info = st.session_state.portfolio[key]
+        p_data = prices_dict.get(key)
+        cur = p_data.get("current") if p_data else None
+        if cur is None or pd.isna(cur):
+            continue
+        valid_entries[key] = {"price": float(cur), "currency": info.get("currency", "JPY")}
+
+    if not valid_entries:
+        return False, None, 0
+
+    n_valid = len(valid_entries)
+    total_jpy = total_amount if input_currency == "JPY" else total_amount * rate
+    equal_per_stock_jpy = total_jpy / n_valid
+
+    # 各銘柄の価格をJPY換算し、最も高い銘柄を特定（＝均等配分の上での制約条件）
+    max_price_jpy = 0
+    for e in valid_entries.values():
+        price_jpy = e["price"] * rate if e["currency"] == "USD" else e["price"]
+        max_price_jpy = max(max_price_jpy, price_jpy)
+
+    if equal_per_stock_jpy < max_price_jpy:
+        min_required_jpy = max_price_jpy * n_valid
+        min_required_display = min_required_jpy if input_currency == "JPY" else min_required_jpy / rate
+        return False, None, min_required_display
+
+    result_shares = {}
+    for key, e in valid_entries.items():
+        equal_amount_native = equal_per_stock_jpy if e["currency"] == "JPY" else equal_per_stock_jpy / rate
+        result_shares[key] = int(equal_amount_native // e["price"])  # 1株単位（切り捨て）
+
+    return True, result_shares, 0
+
+col_refresh, col_ts, col_sim = st.columns([1, 2, 2])
 if col_refresh.button('最新価格に更新'):
     # キャッシュを明示的に破棄してから再実行（手動更新は必ず最新値を取りに行く）
     _fetch_prices_cached.clear()
@@ -711,6 +757,53 @@ if col_refresh.button('最新価格に更新'):
 prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys())
 col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（5分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
+
+with col_sim:
+    sim_amt_col, sim_cur_col = st.columns([2, 1])
+    sim_amount = sim_amt_col.number_input(
+        "投資金額", min_value=0.0, value=0.0, step=1000.0,
+        key="sim_amount", label_visibility="collapsed", placeholder="投資金額"
+    )
+    sim_currency_label = sim_cur_col.selectbox(
+        "単位", ["円", "ドル"], key="sim_currency", label_visibility="collapsed"
+    )
+    sim_currency = "JPY" if sim_currency_label == "円" else "USD"
+
+    sim_btn_col1, sim_btn_col2 = st.columns(2)
+    virtual_order_clicked = sim_btn_col1.button("仮想注文", use_container_width=True)
+    revert_clicked = sim_btn_col2.button("戻す", use_container_width=True)
+
+    if virtual_order_clicked:
+        if not sim_amount or sim_amount <= 0:
+            st.warning("投資金額を入力してください")
+        else:
+            success, result_shares, min_needed = simulate_equal_investment(
+                sim_amount, sim_currency, prices_dict, rate
+            )
+            if success:
+                backup_portfolio()
+                for key, shares in result_shares.items():
+                    p_data = prices_dict.get(key)
+                    cur = p_data.get("current") if p_data else None
+                    st.session_state.portfolio[key]['shares'] = shares
+                    if cur is not None and not pd.isna(cur):
+                        st.session_state.portfolio[key]['cost'] = round(float(cur), 2)
+                save_json(DB_FILE, st.session_state.portfolio)
+                st.success(f"{len(result_shares)}銘柄に均等配分しました")
+                st.rerun()
+            else:
+                unit = "円" if sim_currency == "JPY" else "ドル"
+                st.error(f"投資金額が不足しています。最低 {min_needed:,.0f}{unit} 必要です。")
+
+    if revert_clicked:
+        if st.session_state.prev_portfolio is not None:
+            st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
+            st.session_state.prev_portfolio = None
+            save_json(DB_FILE, st.session_state.portfolio)
+            st.success("仮想注文前の状態に戻しました")
+            st.rerun()
+        else:
+            st.error("戻せる状態がありません")
 
 rows = []
 total_profit_jpy = 0
