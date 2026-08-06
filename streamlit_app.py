@@ -1,7 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 import google.generativeai as genai
 from PIL import Image
 import json
@@ -12,22 +12,12 @@ import gspread
 from google.oauth2.service_account import Credentials
 import csv
 from streamlit_autorefresh import st_autorefresh
-import streamlit.components.v1 as components
-import time
 
 # --- 0. データの保存・読み込み ---
 DB_FILE = "portfolio.json"
 EVENT_FILE = "events.json"
 REMINDER_FILE = "reminder.json"
 CONFIG_FILE = "config.json"
-
-def now_jst():
-    """
-    サーバーの実行環境（Streamlit CloudなどはUTC）によらず、常に日本時間(JST)の
-    naive datetimeを返す。datetime.now()の代わりに、表示・タイムスタンプ保存用途では
-    こちらを使用する。
-    """
-    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=9)
 
 # 【改修箇所】対象のスプレッドシートURLをここに記述してください
 FIXED_SHEET_URL = "https://docs.google.com/spreadsheets/d/17kAFl14q8EaaQ6kvezlAe1Yzr71Yo673T61--_cyESQ/edit"
@@ -53,7 +43,7 @@ def save_json(file_path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 # --- Google Spreadsheet 連携関数 ---
-def get_gspread_client(silent=False):
+def get_gspread_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     try:
         # Streamlit secrets または環境変数から認証情報を取得
@@ -61,8 +51,7 @@ def get_gspread_client(silent=False):
         credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         return gspread.authorize(credentials)
     except Exception as e:
-        if not silent:
-            st.error(f"Google認証に失敗しました: {e}")
+        st.error(f"Google認証に失敗しました: {e}")
         return None
 
 def ensure_header(ws):
@@ -142,7 +131,7 @@ def overwrite_backup_at_index(idx, data):
                 return None
 
         # タイムスタンプは維持したまま、データ部分のみ上書きする
-        keep_ts = expected_ts or actual_ts or now_jst().strftime(TIMESTAMP_FMT)
+        keep_ts = expected_ts or actual_ts or datetime.now().strftime(TIMESTAMP_FMT)
         ws.update(f"A{row_number}:B{row_number}", [[keep_ts, json.dumps(data, ensure_ascii=False)]])
         return keep_ts
     except Exception as e:
@@ -158,7 +147,7 @@ def export_to_spreadsheet(data):
         ws = sh.get_worksheet(0)
         ensure_header(ws)
 
-        timestamp = now_jst().strftime(TIMESTAMP_FMT)
+        timestamp = datetime.now().strftime(TIMESTAMP_FMT)
         ws.append_row([timestamp, json.dumps(data, ensure_ascii=False)])
 
         total = get_backup_count(ws)
@@ -171,36 +160,6 @@ def export_to_spreadsheet(data):
         st.success(f"バックアップを保存しました（{display_ts}）")
     except Exception as e:
         st.error(f"エクスポート失敗: {e}")
-
-def preload_backup_cache():
-    """
-    アプリ起動時に一度だけ呼び出す。直近 INITIAL_CACHE_SIZE 件を先読みして
-    キャッシュしておくことで、初回の「1つ前の設定」操作をAPI呼び出しなしで
-    即座に反映できるようにする。ライブの portfolio には一切手を加えない。
-    """
-    gc = get_gspread_client(silent=True)  # 未設定環境でも起動時にエラーを出さない
-    if not gc:
-        return
-    try:
-        sh = gc.open_by_url(FIXED_SHEET_URL)
-        ws = sh.get_worksheet(0)
-        ensure_header(ws)
-
-        total = get_backup_count(ws)
-        st.session_state.backup_total = total
-        if total == 0:
-            return
-
-        start_idx = max(1, total - INITIAL_CACHE_SIZE + 1)
-        cache, s, e = fetch_backup_range(ws, start_idx, total, total)
-        if cache:
-            st.session_state.backup_cache = cache
-            st.session_state.cache_min = s
-            st.session_state.cache_max = e
-    except Exception:
-        # 起動時のプリロードはあくまで先読み最適化のためのものなので、
-        # 失敗してもアプリ本体の起動は妨げない（黙って諦める）
-        pass
 
 def load_backup_window(center_idx=None, initial=False):
     """
@@ -279,13 +238,6 @@ if 'backup_index' not in st.session_state:
     st.session_state.backup_index = None    # 現在表示中の絶対インデックス（1=最古）
 if 'backup_total' not in st.session_state:
     st.session_state.backup_total = None
-if 'startup_backup_preloaded' not in st.session_state:
-    st.session_state.startup_backup_preloaded = False
-
-if not st.session_state.startup_backup_preloaded:
-    # アプリ起動時に一度だけ、直近のバックアップ履歴を先読みしてキャッシュしておく
-    preload_backup_cache()
-    st.session_state.startup_backup_preloaded = True
 
 # 復元用バックアップ
 def backup_portfolio():
@@ -410,107 +362,29 @@ def build_entries_from_csv(rows, default_shares=100):
 
 def get_live_prices(portfolio_keys):
     prices = {}
-    fetch_errors = {}   # デバッグ用：銘柄ごとの失敗理由を記録
-    fetch_debug = {}    # デバッグ用：成功時も含め、取得元・値を記録
-
     for key in portfolio_keys:
         symbol = key.split('_')[0]
         is_japan = symbol.isdigit() and len(symbol) == 4
         ticker = f"{symbol}.T" if is_japan else ("7013.T" if symbol == "IHI" else symbol)
-
-        got_price = False
-
-        # --- 1. .info（v7/finance/quote エンドポイント）を最優先で試す ---
-        # (get_history_metadata / fast_info / history は、実は全て同じ「チャート用API」を
-        #  内部で共有しており、見た目は別ルートでも実体は同一データだった。
-        #  .info は quoteSummary + v7/finance/quote という完全に別のAPIを叩くため、
-        #  ここでようやく本当に独立した気配値が期待できる。ただし重い呼び出しなので
-        #  失敗時は下位のフォールバックに切り替える)
+        
         try:
             stock = yf.Ticker(ticker)
-            info = stock.info
-            cur = info.get("regularMarketPrice") if info else None
-            if cur is None and info:
-                cur = info.get("currentPrice")
-            prev = info.get("regularMarketPreviousClose") if info else None
-            if prev is None and info:
-                prev = info.get("previousClose")
-            if cur is not None and not pd.isna(cur):
-                prices[key] = {"current": cur, "prev_close": prev}
-                fetch_debug[key] = f"[info] 現在値={cur} 前日終値={prev}"
-                got_price = True
-        except Exception as e:
-            fetch_errors[key] = f"[info] {type(e).__name__}: {e}"
-
-        # --- 2. .info が使えない場合は get_history_metadata() の regularMarketPrice を試す ---
-        # (fast_info.last_price は内部的に history() の日足終値をそのまま使っているだけで、
-        #  実は取引時間中でも更新されないことが判明。regularMarketPrice は
-        #  Yahoo Financeが返す実際の気配値そのものなので、historyの日足よりは新しいはず)
-        if not got_price:
-            try:
-                stock = yf.Ticker(ticker)
-                md = stock.get_history_metadata()
-                cur = md.get("regularMarketPrice") if md else None
-                prev = md.get("chartPreviousClose") if md else None
-                if prev is None and md:
-                    prev = md.get("previousClose")
-                if cur is not None and not pd.isna(cur):
-                    prices[key] = {"current": cur, "prev_close": prev}
-                    fetch_debug[key] = f"[metadata] 現在値={cur} 前日終値={prev}"
-                    got_price = True
-            except Exception as e:
-                fetch_errors[key] = fetch_errors.get(key, "") + f" / [metadata] {type(e).__name__}: {e}"
-
-        if not got_price:
-            # --- 3. metadataも使えない場合は fast_info を試す ---
-            try:
-                stock = yf.Ticker(ticker)
-                fi = stock.fast_info
-                cur = fi.get("lastPrice") if fi else None
-                prev = fi.get("previousClose") if fi else None
-                if cur is not None and not pd.isna(cur):
-                    prices[key] = {"current": cur, "prev_close": prev}
-                    fetch_debug[key] = f"[fast_info] 現在値={cur:.2f} 前日終値={prev}"
-                    got_price = True
-            except Exception as e:
-                fetch_errors[key] = fetch_errors.get(key, "") + f" / [fast_info] {type(e).__name__}: {e}"
-
-        if not got_price:
-            # --- 4. それでもダメなら従来の日足取得にフォールバック ---
-            try:
-                stock = yf.Ticker(ticker)
-                hist = stock.history(period="5d")
-                if not hist.empty:
-                    last_close = hist['Close'].iloc[-1]
-                    last_dt = hist.index[-1]
-                    prices[key] = {
-                        "current": last_close,
-                        "prev_close": hist['Close'].iloc[-2] if len(hist) >= 2 else None
-                    }
-                    fetch_debug[key] = f"[history フォールバック] {last_dt} 終値={last_close:.2f}（{len(hist)}本取得）"
-                    got_price = True
-                else:
-                    prices[key] = None
-                    fetch_errors[key] = fetch_errors.get(key, "") + " / 空のデータが返されました（レート制限の可能性）"
-            except Exception as e:
+            hist = stock.history(period="5d")
+            if not hist.empty:
+                prices[key] = {
+                    "current": hist['Close'].iloc[-1],
+                    "prev_close": hist['Close'].iloc[-2] if len(hist) >= 2 else None
+                }
+            else:
                 prices[key] = None
-                fetch_errors[key] = fetch_errors.get(key, "") + f" / [history] {type(e).__name__}: {e}"
-
-        time.sleep(0.3)  # .info は複数リクエストが飛ぶ重い呼び出しのため、間隔を少し長めに
-
+        except:
+            prices[key] = None
+            
     try:
-        usdjpy_md = yf.Ticker("JPY=X").get_history_metadata()
-        prices["USDJPY"] = usdjpy_md.get("regularMarketPrice", 159.2) if usdjpy_md else 159.2
-    except Exception:
-        try:
-            usdjpy = yf.Ticker("JPY=X").history(period="5d")
-            prices["USDJPY"] = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
-        except Exception as e:
-            prices["USDJPY"] = 159.2
-            fetch_errors["USDJPY"] = f"{type(e).__name__}: {e}"
-
-    prices["_fetch_errors"] = fetch_errors
-    prices["_fetch_debug"] = fetch_debug
+        usdjpy = yf.Ticker("JPY=X").history(period="5d")
+        prices["USDJPY"] = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
+    except:
+        prices["USDJPY"] = 159.2
     return prices
 
 PRICE_CACHE_TTL_SECONDS = 300  # 5分
@@ -519,7 +393,7 @@ PRICE_CACHE_TTL_SECONDS = 300  # 5分
 def _fetch_prices_cached(keys_tuple):
     """get_live_prices の結果を5分間キャッシュする。取得時刻も併せて返す。"""
     prices = get_live_prices(list(keys_tuple))
-    return prices, now_jst()
+    return prices, datetime.now()
 
 def get_prices_with_cache(portfolio_keys):
     """
@@ -528,7 +402,7 @@ def get_prices_with_cache(portfolio_keys):
     """
     keys_tuple = tuple(sorted(portfolio_keys))
     if not keys_tuple:
-        return {"USDJPY": 159.2}, now_jst()
+        return {"USDJPY": 159.2}, datetime.now()
     return _fetch_prices_cached(keys_tuple)
 
 # 【オリジナルを完全踏襲】
@@ -583,63 +457,6 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
-
-# --- キーボードショートカット（← → で バックアップ履歴を前後に移動） ---
-components.html("""
-<script>
-(function() {
-    function tryInstall() {
-        let doc;
-        try {
-            doc = window.parent.document;
-        } catch (err) {
-            return false; // 親フレームがまだ準備できていない → 後でリトライ
-        }
-        if (!doc) { return false; }
-        // 複数回のrerunや複数回のリトライでリスナーが重複登録されるのを防ぐためのフラグ
-        if (doc.__backupNavKeyListenerInstalled) { return true; }
-
-        function clickButtonByText(text) {
-            const buttons = Array.from(doc.querySelectorAll('button'));
-            const target = buttons.find(btn => btn.innerText.trim() === text);
-            if (target) { target.click(); }
-        }
-
-        doc.addEventListener('keydown', function(e) {
-            const active = doc.activeElement;
-            const tag = active ? active.tagName.toLowerCase() : '';
-            // 入力欄にフォーカスがある間は矢印キー本来の動作（カーソル移動等）を妨げない
-            if (tag === 'input' || tag === 'textarea' || (active && active.isContentEditable)) {
-                return;
-            }
-            if (e.key === 'ArrowRight') {
-                clickButtonByText('1つ後の設定 ▶');
-                e.preventDefault();
-            } else if (e.key === 'ArrowLeft') {
-                clickButtonByText('◀ 1つ前の設定');
-                e.preventDefault();
-            }
-        });
-
-        doc.__backupNavKeyListenerInstalled = true;
-        return true;
-    }
-
-    // 起動直後は親フレームの準備が間に合わずインストールに失敗することがあるため、
-    // 成功するまで短い間隔でリトライする（最大 約5秒間）
-    if (!tryInstall()) {
-        let attempts = 0;
-        const maxAttempts = 20; // 250ms × 20 = 5秒
-        const retryTimer = setInterval(function() {
-            attempts++;
-            if (tryInstall() || attempts >= maxAttempts) {
-                clearInterval(retryTimer);
-            }
-        }, 250);
-    }
-})();
-</script>
-""", height=0)
 
 with st.sidebar:
     st.header("🔑 Settings")
@@ -788,12 +605,8 @@ with st.sidebar:
 
     if prev_clicked:
         if st.session_state.backup_index is None:
-            if st.session_state.cache_min is not None and st.session_state.backup_total:
-                # 起動時にプリロード済みのキャッシュをそのまま使う（API呼び出し不要）
-                apply_backup_index(st.session_state.backup_total)
-            else:
-                # プリロードが未実施・失敗していた場合のフォールバック
-                load_backup_window(initial=True)
+            # 初回：直近 INITIAL_CACHE_SIZE 件を読み込み、最新のものを表示
+            load_backup_window(initial=True)
         else:
             target = st.session_state.backup_index - 1
             if target < 1:
@@ -889,53 +702,7 @@ st.header("📉 Portfolio Monitor")
 # 5分（300,000ミリ秒）ごとに自動で画面を再実行する
 st_autorefresh(interval=PRICE_CACHE_TTL_SECONDS * 1000, key="auto_price_refresh")
 
-def simulate_equal_investment(total_amount, input_currency, prices_dict, rate):
-    """
-    現在のポートフォリオ銘柄に、投資金額を均等配分する。
-    - 投資額はJPY基準に変換した上で銘柄数で等分する
-    - 各銘柄は自国通貨に変換し、現在株価で1株単位（切り捨て）の株数を算出する
-    戻り値: (success, {key: shares} または None, 必要最低金額(入力通貨換算) または 0)
-    """
-    keys = list(st.session_state.portfolio.keys())
-    if not keys:
-        return False, None, 0
-
-    # 現在価格を取得できた銘柄のみを対象にする
-    valid_entries = {}
-    for key in keys:
-        info = st.session_state.portfolio[key]
-        p_data = prices_dict.get(key)
-        cur = p_data.get("current") if p_data else None
-        if cur is None or pd.isna(cur):
-            continue
-        valid_entries[key] = {"price": float(cur), "currency": info.get("currency", "JPY")}
-
-    if not valid_entries:
-        return False, None, 0
-
-    n_valid = len(valid_entries)
-    total_jpy = total_amount if input_currency == "JPY" else total_amount * rate
-    equal_per_stock_jpy = total_jpy / n_valid
-
-    # 各銘柄の価格をJPY換算し、最も高い銘柄を特定（＝均等配分の上での制約条件）
-    max_price_jpy = 0
-    for e in valid_entries.values():
-        price_jpy = e["price"] * rate if e["currency"] == "USD" else e["price"]
-        max_price_jpy = max(max_price_jpy, price_jpy)
-
-    if equal_per_stock_jpy < max_price_jpy:
-        min_required_jpy = max_price_jpy * n_valid
-        min_required_display = min_required_jpy if input_currency == "JPY" else min_required_jpy / rate
-        return False, None, min_required_display
-
-    result_shares = {}
-    for key, e in valid_entries.items():
-        equal_amount_native = equal_per_stock_jpy if e["currency"] == "JPY" else equal_per_stock_jpy / rate
-        result_shares[key] = int(equal_amount_native // e["price"])  # 1株単位（切り捨て）
-
-    return True, result_shares, 0
-
-col_refresh, col_ts, col_sim = st.columns([1, 2, 2])
+col_refresh, col_ts = st.columns([1, 3])
 if col_refresh.button('最新価格に更新'):
     # キャッシュを明示的に破棄してから再実行（手動更新は必ず最新値を取りに行く）
     _fetch_prices_cached.clear()
@@ -944,67 +711,6 @@ if col_refresh.button('最新価格に更新'):
 prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys())
 col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（5分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
-
-# --- 価格取得エラーの診断表示（原因調査用） ---
-_fetch_errors = prices_dict.get("_fetch_errors", {})
-_fetch_debug = prices_dict.get("_fetch_debug", {})
-if _fetch_errors:
-    with st.expander(f"⚠️ 価格取得に失敗した銘柄があります（{len(_fetch_errors)}件）"):
-        for err_key, err_msg in _fetch_errors.items():
-            st.caption(f"**{err_key}**: {err_msg}")
-if _fetch_debug:
-    with st.expander("🔍 取得データの詳細（デバッグ用）", expanded=False):
-        st.caption("表示中の「終値」がYahoo Financeから返ってきた最新の値です。"
-                   "「最新価格に更新」を数分あけて複数回押し、ここの日時・値が動くか確認してください。")
-        for dbg_key, dbg_msg in _fetch_debug.items():
-            st.caption(f"**{dbg_key}**: {dbg_msg}")
-
-with col_sim:
-    sim_amt_col, sim_cur_col = st.columns([2, 1])
-    sim_amount = sim_amt_col.number_input(
-        "投資金額", min_value=0.0, value=0.0, step=1000.0,
-        key="sim_amount", label_visibility="collapsed", placeholder="投資金額"
-    )
-    sim_currency_label = sim_cur_col.selectbox(
-        "単位", ["円", "ドル"], key="sim_currency", label_visibility="collapsed"
-    )
-    sim_currency = "JPY" if sim_currency_label == "円" else "USD"
-
-    sim_btn_col1, sim_btn_col2 = st.columns(2)
-    virtual_order_clicked = sim_btn_col1.button("仮想注文", use_container_width=True)
-    revert_clicked = sim_btn_col2.button("戻す", use_container_width=True)
-
-    if virtual_order_clicked:
-        if not sim_amount or sim_amount <= 0:
-            st.warning("投資金額を入力してください")
-        else:
-            success, result_shares, min_needed = simulate_equal_investment(
-                sim_amount, sim_currency, prices_dict, rate
-            )
-            if success:
-                backup_portfolio()
-                for key, shares in result_shares.items():
-                    p_data = prices_dict.get(key)
-                    cur = p_data.get("current") if p_data else None
-                    st.session_state.portfolio[key]['shares'] = shares
-                    if cur is not None and not pd.isna(cur):
-                        st.session_state.portfolio[key]['cost'] = round(float(cur), 2)
-                save_json(DB_FILE, st.session_state.portfolio)
-                st.success(f"{len(result_shares)}銘柄に均等配分しました")
-                st.rerun()
-            else:
-                unit = "円" if sim_currency == "JPY" else "ドル"
-                st.error(f"投資金額が不足しています。最低 {min_needed:,.0f}{unit} 必要です。")
-
-    if revert_clicked:
-        if st.session_state.prev_portfolio is not None:
-            st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
-            st.session_state.prev_portfolio = None
-            save_json(DB_FILE, st.session_state.portfolio)
-            st.success("仮想注文前の状態に戻しました")
-            st.rerun()
-        else:
-            st.error("戻せる状態がありません")
 
 rows = []
 total_profit_jpy = 0
@@ -1102,7 +808,7 @@ if st.session_state.events:
         for j, event in enumerate(chunk):
             try:
                 target_date = datetime.strptime(event['date'], "%Y-%m-%d")
-                days_left = (target_date - now_jst()).days
+                days_left = (target_date - datetime.now()).days
                 # フォントサイズの調整と重なり防止のため改行を含むマークダウンを使用
                 cols[j].markdown(f"**{event['name']}**", unsafe_allow_html=True)
                 cols[j].metric("", event['date'], f"あと {days_left} 日")
