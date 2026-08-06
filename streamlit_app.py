@@ -420,26 +420,49 @@ def get_live_prices(portfolio_keys):
 
         got_price = False
 
-        # --- 1. get_history_metadata() の regularMarketPrice を最優先で試す ---
-        # (fast_info.last_price は内部的に history() の日足終値をそのまま使っているだけで、
-        #  実は取引時間中でも更新されないことが判明。regularMarketPrice は
-        #  Yahoo Financeが返す実際の気配値そのものなので、こちらが本当の「現在値」)
+        # --- 1. .info（v7/finance/quote エンドポイント）を最優先で試す ---
+        # (get_history_metadata / fast_info / history は、実は全て同じ「チャート用API」を
+        #  内部で共有しており、見た目は別ルートでも実体は同一データだった。
+        #  .info は quoteSummary + v7/finance/quote という完全に別のAPIを叩くため、
+        #  ここでようやく本当に独立した気配値が期待できる。ただし重い呼び出しなので
+        #  失敗時は下位のフォールバックに切り替える)
         try:
             stock = yf.Ticker(ticker)
-            md = stock.get_history_metadata()
-            cur = md.get("regularMarketPrice") if md else None
-            prev = md.get("chartPreviousClose") if md else None
-            if prev is None and md:
-                prev = md.get("previousClose")
+            info = stock.info
+            cur = info.get("regularMarketPrice") if info else None
+            if cur is None and info:
+                cur = info.get("currentPrice")
+            prev = info.get("regularMarketPreviousClose") if info else None
+            if prev is None and info:
+                prev = info.get("previousClose")
             if cur is not None and not pd.isna(cur):
                 prices[key] = {"current": cur, "prev_close": prev}
-                fetch_debug[key] = f"[metadata] 現在値={cur} 前日終値={prev}"
+                fetch_debug[key] = f"[info] 現在値={cur} 前日終値={prev}"
                 got_price = True
         except Exception as e:
-            fetch_errors[key] = f"[metadata] {type(e).__name__}: {e}"
+            fetch_errors[key] = f"[info] {type(e).__name__}: {e}"
+
+        # --- 2. .info が使えない場合は get_history_metadata() の regularMarketPrice を試す ---
+        # (fast_info.last_price は内部的に history() の日足終値をそのまま使っているだけで、
+        #  実は取引時間中でも更新されないことが判明。regularMarketPrice は
+        #  Yahoo Financeが返す実際の気配値そのものなので、historyの日足よりは新しいはず)
+        if not got_price:
+            try:
+                stock = yf.Ticker(ticker)
+                md = stock.get_history_metadata()
+                cur = md.get("regularMarketPrice") if md else None
+                prev = md.get("chartPreviousClose") if md else None
+                if prev is None and md:
+                    prev = md.get("previousClose")
+                if cur is not None and not pd.isna(cur):
+                    prices[key] = {"current": cur, "prev_close": prev}
+                    fetch_debug[key] = f"[metadata] 現在値={cur} 前日終値={prev}"
+                    got_price = True
+            except Exception as e:
+                fetch_errors[key] = fetch_errors.get(key, "") + f" / [metadata] {type(e).__name__}: {e}"
 
         if not got_price:
-            # --- 2. metadataが使えない場合は fast_info を試す ---
+            # --- 3. metadataも使えない場合は fast_info を試す ---
             try:
                 stock = yf.Ticker(ticker)
                 fi = stock.fast_info
@@ -453,7 +476,7 @@ def get_live_prices(portfolio_keys):
                 fetch_errors[key] = fetch_errors.get(key, "") + f" / [fast_info] {type(e).__name__}: {e}"
 
         if not got_price:
-            # --- 3. それでもダメなら従来の日足取得にフォールバック ---
+            # --- 4. それでもダメなら従来の日足取得にフォールバック ---
             try:
                 stock = yf.Ticker(ticker)
                 hist = stock.history(period="5d")
@@ -473,7 +496,7 @@ def get_live_prices(portfolio_keys):
                 prices[key] = None
                 fetch_errors[key] = fetch_errors.get(key, "") + f" / [history] {type(e).__name__}: {e}"
 
-        time.sleep(0.15)  # 連続リクエストによるレート制限を避けるための小休止
+        time.sleep(0.3)  # .info は複数リクエストが飛ぶ重い呼び出しのため、間隔を少し長めに
 
     try:
         usdjpy_md = yf.Ticker("JPY=X").get_history_metadata()
