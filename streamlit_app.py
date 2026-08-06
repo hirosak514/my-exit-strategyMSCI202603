@@ -501,32 +501,55 @@ st.markdown("""
 components.html("""
 <script>
 (function() {
-    const doc = window.parent.document;
-    // 複数回のrerunでリスナーが重複登録されるのを防ぐためのフラグ
-    if (doc.__backupNavKeyListenerInstalled) { return; }
-    doc.__backupNavKeyListenerInstalled = true;
+    function tryInstall() {
+        let doc;
+        try {
+            doc = window.parent.document;
+        } catch (err) {
+            return false; // 親フレームがまだ準備できていない → 後でリトライ
+        }
+        if (!doc) { return false; }
+        // 複数回のrerunや複数回のリトライでリスナーが重複登録されるのを防ぐためのフラグ
+        if (doc.__backupNavKeyListenerInstalled) { return true; }
 
-    function clickButtonByText(text) {
-        const buttons = Array.from(doc.querySelectorAll('button'));
-        const target = buttons.find(btn => btn.innerText.trim() === text);
-        if (target) { target.click(); }
+        function clickButtonByText(text) {
+            const buttons = Array.from(doc.querySelectorAll('button'));
+            const target = buttons.find(btn => btn.innerText.trim() === text);
+            if (target) { target.click(); }
+        }
+
+        doc.addEventListener('keydown', function(e) {
+            const active = doc.activeElement;
+            const tag = active ? active.tagName.toLowerCase() : '';
+            // 入力欄にフォーカスがある間は矢印キー本来の動作（カーソル移動等）を妨げない
+            if (tag === 'input' || tag === 'textarea' || (active && active.isContentEditable)) {
+                return;
+            }
+            if (e.key === 'ArrowRight') {
+                clickButtonByText('1つ後の設定 ▶');
+                e.preventDefault();
+            } else if (e.key === 'ArrowLeft') {
+                clickButtonByText('◀ 1つ前の設定');
+                e.preventDefault();
+            }
+        });
+
+        doc.__backupNavKeyListenerInstalled = true;
+        return true;
     }
 
-    doc.addEventListener('keydown', function(e) {
-        const active = doc.activeElement;
-        const tag = active ? active.tagName.toLowerCase() : '';
-        // 入力欄にフォーカスがある間は矢印キー本来の動作（カーソル移動等）を妨げない
-        if (tag === 'input' || tag === 'textarea' || (active && active.isContentEditable)) {
-            return;
-        }
-        if (e.key === 'ArrowRight') {
-            clickButtonByText('1つ後の設定 ▶');
-            e.preventDefault();
-        } else if (e.key === 'ArrowLeft') {
-            clickButtonByText('◀ 1つ前の設定');
-            e.preventDefault();
-        }
-    });
+    // 起動直後は親フレームの準備が間に合わずインストールに失敗することがあるため、
+    // 成功するまで短い間隔でリトライする（最大 約5秒間）
+    if (!tryInstall()) {
+        let attempts = 0;
+        const maxAttempts = 20; // 250ms × 20 = 5秒
+        const retryTimer = setInterval(function() {
+            attempts++;
+            if (tryInstall() || attempts >= maxAttempts) {
+                clearInterval(retryTimer);
+            }
+        }, 250);
+    }
 })();
 </script>
 """, height=0)
