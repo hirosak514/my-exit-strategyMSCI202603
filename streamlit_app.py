@@ -1,7 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import google.generativeai as genai
 from PIL import Image
 import json
@@ -20,6 +20,14 @@ DB_FILE = "portfolio.json"
 EVENT_FILE = "events.json"
 REMINDER_FILE = "reminder.json"
 CONFIG_FILE = "config.json"
+
+def now_jst():
+    """
+    サーバーの実行環境（Streamlit CloudなどはUTC）によらず、常に日本時間(JST)の
+    naive datetimeを返す。datetime.now()の代わりに、表示・タイムスタンプ保存用途では
+    こちらを使用する。
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=9)
 
 # 【改修箇所】対象のスプレッドシートURLをここに記述してください
 FIXED_SHEET_URL = "https://docs.google.com/spreadsheets/d/17kAFl14q8EaaQ6kvezlAe1Yzr71Yo673T61--_cyESQ/edit"
@@ -134,7 +142,7 @@ def overwrite_backup_at_index(idx, data):
                 return None
 
         # タイムスタンプは維持したまま、データ部分のみ上書きする
-        keep_ts = expected_ts or actual_ts or datetime.now().strftime(TIMESTAMP_FMT)
+        keep_ts = expected_ts or actual_ts or now_jst().strftime(TIMESTAMP_FMT)
         ws.update(f"A{row_number}:B{row_number}", [[keep_ts, json.dumps(data, ensure_ascii=False)]])
         return keep_ts
     except Exception as e:
@@ -150,7 +158,7 @@ def export_to_spreadsheet(data):
         ws = sh.get_worksheet(0)
         ensure_header(ws)
 
-        timestamp = datetime.now().strftime(TIMESTAMP_FMT)
+        timestamp = now_jst().strftime(TIMESTAMP_FMT)
         ws.append_row([timestamp, json.dumps(data, ensure_ascii=False)])
 
         total = get_backup_count(ws)
@@ -403,39 +411,62 @@ def build_entries_from_csv(rows, default_shares=100):
 def get_live_prices(portfolio_keys):
     prices = {}
     fetch_errors = {}   # デバッグ用：銘柄ごとの失敗理由を記録
-    fetch_debug = {}    # デバッグ用：成功時も含め、取得できた足の日時を記録
+    fetch_debug = {}    # デバッグ用：成功時も含め、取得元・値を記録
 
     for key in portfolio_keys:
         symbol = key.split('_')[0]
         is_japan = symbol.isdigit() and len(symbol) == 4
         ticker = f"{symbol}.T" if is_japan else ("7013.T" if symbol == "IHI" else symbol)
 
+        got_price = False
         try:
+            # --- 1. まず fast_info でリアルタイムに近い気配値を試す ---
+            # (history()の日足は、その日の足が確定するまで前日終値のままになるため、
+            #  取引時間中の「現在値」としては不向き)
             stock = yf.Ticker(ticker)
-            hist = stock.history(period="5d")
-            if not hist.empty:
-                last_close = hist['Close'].iloc[-1]
-                last_dt = hist.index[-1]
-                prices[key] = {
-                    "current": last_close,
-                    "prev_close": hist['Close'].iloc[-2] if len(hist) >= 2 else None
-                }
-                fetch_debug[key] = f"{last_dt} 終値={last_close:.2f}（{len(hist)}本取得）"
-            else:
-                prices[key] = None
-                fetch_errors[key] = "空のデータが返されました（レート制限の可能性）"
+            fi = stock.fast_info
+            cur = fi.get("lastPrice") if fi else None
+            prev = fi.get("previousClose") if fi else None
+            if cur is not None and not pd.isna(cur):
+                prices[key] = {"current": cur, "prev_close": prev}
+                fetch_debug[key] = f"[fast_info] 現在値={cur:.2f} 前日終値={prev}"
+                got_price = True
         except Exception as e:
-            prices[key] = None
-            fetch_errors[key] = f"{type(e).__name__}: {e}"
+            fetch_errors[key] = f"[fast_info] {type(e).__name__}: {e}"
+
+        if not got_price:
+            # --- 2. fast_info が使えない場合は、従来の日足取得にフォールバック ---
+            try:
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period="5d")
+                if not hist.empty:
+                    last_close = hist['Close'].iloc[-1]
+                    last_dt = hist.index[-1]
+                    prices[key] = {
+                        "current": last_close,
+                        "prev_close": hist['Close'].iloc[-2] if len(hist) >= 2 else None
+                    }
+                    fetch_debug[key] = f"[history フォールバック] {last_dt} 終値={last_close:.2f}（{len(hist)}本取得）"
+                    got_price = True
+                else:
+                    prices[key] = None
+                    fetch_errors[key] = fetch_errors.get(key, "") + " / 空のデータが返されました（レート制限の可能性）"
+            except Exception as e:
+                prices[key] = None
+                fetch_errors[key] = fetch_errors.get(key, "") + f" / [history] {type(e).__name__}: {e}"
 
         time.sleep(0.15)  # 連続リクエストによるレート制限を避けるための小休止
 
     try:
-        usdjpy = yf.Ticker("JPY=X").history(period="5d")
-        prices["USDJPY"] = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
-    except Exception as e:
-        prices["USDJPY"] = 159.2
-        fetch_errors["USDJPY"] = f"{type(e).__name__}: {e}"
+        usdjpy_fi = yf.Ticker("JPY=X").fast_info
+        prices["USDJPY"] = usdjpy_fi.get("lastPrice", 159.2) if usdjpy_fi else 159.2
+    except Exception:
+        try:
+            usdjpy = yf.Ticker("JPY=X").history(period="5d")
+            prices["USDJPY"] = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
+        except Exception as e:
+            prices["USDJPY"] = 159.2
+            fetch_errors["USDJPY"] = f"{type(e).__name__}: {e}"
 
     prices["_fetch_errors"] = fetch_errors
     prices["_fetch_debug"] = fetch_debug
@@ -447,7 +478,7 @@ PRICE_CACHE_TTL_SECONDS = 300  # 5分
 def _fetch_prices_cached(keys_tuple):
     """get_live_prices の結果を5分間キャッシュする。取得時刻も併せて返す。"""
     prices = get_live_prices(list(keys_tuple))
-    return prices, datetime.now()
+    return prices, now_jst()
 
 def get_prices_with_cache(portfolio_keys):
     """
@@ -456,7 +487,7 @@ def get_prices_with_cache(portfolio_keys):
     """
     keys_tuple = tuple(sorted(portfolio_keys))
     if not keys_tuple:
-        return {"USDJPY": 159.2}, datetime.now()
+        return {"USDJPY": 159.2}, now_jst()
     return _fetch_prices_cached(keys_tuple)
 
 # 【オリジナルを完全踏襲】
@@ -1030,7 +1061,7 @@ if st.session_state.events:
         for j, event in enumerate(chunk):
             try:
                 target_date = datetime.strptime(event['date'], "%Y-%m-%d")
-                days_left = (target_date - datetime.now()).days
+                days_left = (target_date - now_jst()).days
                 # フォントサイズの調整と重なり防止のため改行を含むマークダウンを使用
                 cols[j].markdown(f"**{event['name']}**", unsafe_allow_html=True)
                 cols[j].metric("", event['date'], f"あと {days_left} 日")
