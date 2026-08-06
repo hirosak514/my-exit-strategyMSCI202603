@@ -13,6 +13,7 @@ from google.oauth2.service_account import Credentials
 import csv
 from streamlit_autorefresh import st_autorefresh
 import streamlit.components.v1 as components
+import time
 
 # --- 0. データの保存・読み込み ---
 DB_FILE = "portfolio.json"
@@ -401,11 +402,12 @@ def build_entries_from_csv(rows, default_shares=100):
 
 def get_live_prices(portfolio_keys):
     prices = {}
+    fetch_errors = {}  # デバッグ用：銘柄ごとの失敗理由を記録
     for key in portfolio_keys:
         symbol = key.split('_')[0]
         is_japan = symbol.isdigit() and len(symbol) == 4
         ticker = f"{symbol}.T" if is_japan else ("7013.T" if symbol == "IHI" else symbol)
-        
+
         try:
             stock = yf.Ticker(ticker)
             hist = stock.history(period="5d")
@@ -416,14 +418,21 @@ def get_live_prices(portfolio_keys):
                 }
             else:
                 prices[key] = None
-        except:
+                fetch_errors[key] = "空のデータが返されました（レート制限の可能性）"
+        except Exception as e:
             prices[key] = None
-            
+            fetch_errors[key] = f"{type(e).__name__}: {e}"
+
+        time.sleep(0.15)  # 連続リクエストによるレート制限を避けるための小休止
+
     try:
         usdjpy = yf.Ticker("JPY=X").history(period="5d")
         prices["USDJPY"] = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
-    except:
+    except Exception as e:
         prices["USDJPY"] = 159.2
+        fetch_errors["USDJPY"] = f"{type(e).__name__}: {e}"
+
+    prices["_fetch_errors"] = fetch_errors
     return prices
 
 PRICE_CACHE_TTL_SECONDS = 300  # 5分
@@ -857,6 +866,13 @@ if col_refresh.button('最新価格に更新'):
 prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys())
 col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（5分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
+
+# --- 価格取得エラーの診断表示（原因調査用） ---
+_fetch_errors = prices_dict.get("_fetch_errors", {})
+if _fetch_errors:
+    with st.expander(f"⚠️ 価格取得に失敗した銘柄があります（{len(_fetch_errors)}件）"):
+        for err_key, err_msg in _fetch_errors.items():
+            st.caption(f"**{err_key}**: {err_msg}")
 
 with col_sim:
     sim_amt_col, sim_cur_col = st.columns([2, 1])
