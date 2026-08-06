@@ -402,7 +402,9 @@ def build_entries_from_csv(rows, default_shares=100):
 
 def get_live_prices(portfolio_keys):
     prices = {}
-    fetch_errors = {}  # デバッグ用：銘柄ごとの失敗理由を記録
+    fetch_errors = {}   # デバッグ用：銘柄ごとの失敗理由を記録
+    fetch_debug = {}    # デバッグ用：成功時も含め、取得できた足の日時を記録
+
     for key in portfolio_keys:
         symbol = key.split('_')[0]
         is_japan = symbol.isdigit() and len(symbol) == 4
@@ -412,10 +414,13 @@ def get_live_prices(portfolio_keys):
             stock = yf.Ticker(ticker)
             hist = stock.history(period="5d")
             if not hist.empty:
+                last_close = hist['Close'].iloc[-1]
+                last_dt = hist.index[-1]
                 prices[key] = {
-                    "current": hist['Close'].iloc[-1],
+                    "current": last_close,
                     "prev_close": hist['Close'].iloc[-2] if len(hist) >= 2 else None
                 }
+                fetch_debug[key] = f"{last_dt} 終値={last_close:.2f}（{len(hist)}本取得）"
             else:
                 prices[key] = None
                 fetch_errors[key] = "空のデータが返されました（レート制限の可能性）"
@@ -433,6 +438,7 @@ def get_live_prices(portfolio_keys):
         fetch_errors["USDJPY"] = f"{type(e).__name__}: {e}"
 
     prices["_fetch_errors"] = fetch_errors
+    prices["_fetch_debug"] = fetch_debug
     return prices
 
 PRICE_CACHE_TTL_SECONDS = 300  # 5分
@@ -869,10 +875,17 @@ rate = prices_dict.get("USDJPY", 159.2)
 
 # --- 価格取得エラーの診断表示（原因調査用） ---
 _fetch_errors = prices_dict.get("_fetch_errors", {})
+_fetch_debug = prices_dict.get("_fetch_debug", {})
 if _fetch_errors:
     with st.expander(f"⚠️ 価格取得に失敗した銘柄があります（{len(_fetch_errors)}件）"):
         for err_key, err_msg in _fetch_errors.items():
             st.caption(f"**{err_key}**: {err_msg}")
+if _fetch_debug:
+    with st.expander("🔍 取得データの詳細（デバッグ用）", expanded=False):
+        st.caption("表示中の「終値」がYahoo Financeから返ってきた最新の値です。"
+                   "「最新価格に更新」を数分あけて複数回押し、ここの日時・値が動くか確認してください。")
+        for dbg_key, dbg_msg in _fetch_debug.items():
+            st.caption(f"**{dbg_key}**: {dbg_msg}")
 
 with col_sim:
     sim_amt_col, sim_cur_col = st.columns([2, 1])
