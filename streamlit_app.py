@@ -1082,20 +1082,6 @@ prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.key
 col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（15分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
 
-# --- 価格取得エラーの診断表示（原因調査用） ---
-_fetch_errors = prices_dict.get("_fetch_errors", {})
-_fetch_debug = prices_dict.get("_fetch_debug", {})
-if _fetch_errors:
-    with st.expander(f"⚠️ 価格取得に失敗した銘柄があります（{len(_fetch_errors)}件）"):
-        for err_key, err_msg in _fetch_errors.items():
-            st.caption(f"**{err_key}**: {err_msg}")
-if _fetch_debug:
-    with st.expander("🔍 取得データの詳細（デバッグ用）", expanded=False):
-        st.caption("表示中の「終値」がYahoo Financeから返ってきた最新の値です。"
-                   "「最新価格に更新」を数分あけて複数回押し、ここの日時・値が動くか確認してください。")
-        for dbg_key, dbg_msg in _fetch_debug.items():
-            st.caption(f"**{dbg_key}**: {dbg_msg}")
-
 # --- 仮想注文パネル（画面右下に固定表示） ---
 with st.container(key="floating_sim_panel"):
     sim_amt_col, sim_cur_col = st.columns([2, 1])
@@ -1249,3 +1235,18 @@ if st.session_state.events:
 st.divider()
 st.subheader("📋 Reminder")
 st.info(st.session_state.reminder_text)
+
+# --- 価格取得エラーの診断表示（原因調査用・画面最下部） ---
+st.divider()
+_fetch_errors = prices_dict.get("_fetch_errors", {})
+_fetch_debug = prices_dict.get("_fetch_debug", {})
+if _fetch_errors:
+    with st.expander(f"⚠️ 価格取得に失敗した銘柄があります（{len(_fetch_errors)}件）"):
+        for err_key, err_msg in _fetch_errors.items():
+            st.caption(f"**{err_key}**: {err_msg}")
+if _fetch_debug:
+    with st.expander("🔍 取得データの詳細（デバッグ用）", expanded=False):
+        st.caption("表示中の「終値」がYahoo Financeから返ってきた最新の値です。"
+                   "「最新価格に更新」を数分あけて複数回押し、ここの日時・値が動くか確認してください。")
+        for dbg_key, dbg_msg in _fetch_debug.items():
+            st.caption(f"**{dbg_key}**: {dbg_msg}")
