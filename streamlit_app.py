@@ -690,6 +690,19 @@ st.markdown("""
         background-color: #ff4b4b !important;
         color: white !important;
     }
+    /* 仮想注文パネルを画面右下に固定表示する */
+    div[class*="st-key-floating_sim_panel"] {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        width: 320px;
+        background-color: #0e1117;
+        border: 1px solid #444;
+        border-radius: 10px;
+        padding: 14px 16px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
+        z-index: 9999;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -939,7 +952,7 @@ with st.sidebar:
                 apply_backup_index(target)
         st.rerun()
 
-    # --- 現在表示中のバックアップ日時を表示 ---
+    # --- 現在表示中のバックアップ情報を表示（保存No. / 保存日付） ---
     if st.session_state.backup_index is not None:
         entry = st.session_state.backup_cache.get(st.session_state.backup_index)
         if entry:
@@ -949,7 +962,10 @@ with st.sidebar:
             except Exception:
                 display_ts = entry["timestamp"]
             total_disp = st.session_state.backup_total or "?"
-            st.caption(f"📅 表示中のバックアップ：**{display_ts}**（{st.session_state.backup_index} / {total_disp} 件目）")
+            st.info(f"📌 保存No.: **{st.session_state.backup_index} / {total_disp}**\n\n"
+                    f"📅 保存日付: **{display_ts}**")
+    else:
+        st.caption("バックアップ履歴はまだ読み込まれていません（「◀ 1つ前の設定」を押すと表示されます）")
 
     st.divider()
     st.header("📄 CSV読み込み")
@@ -1056,7 +1072,7 @@ def simulate_equal_investment(total_amount, input_currency, prices_dict, rate):
 
     return True, result_shares, 0
 
-col_refresh, col_ts, col_sim = st.columns([1, 2, 2])
+col_refresh, col_ts = st.columns([1, 3])
 if col_refresh.button('最新価格に更新'):
     # キャッシュを明示的に破棄してから再実行（手動更新は必ず最新値を取りに行く）
     _fetch_prices_cached.clear()
@@ -1080,7 +1096,8 @@ if _fetch_debug:
         for dbg_key, dbg_msg in _fetch_debug.items():
             st.caption(f"**{dbg_key}**: {dbg_msg}")
 
-with col_sim:
+# --- 仮想注文パネル（画面右下に固定表示） ---
+with st.container(key="floating_sim_panel"):
     sim_amt_col, sim_cur_col = st.columns([2, 1])
     sim_amount = sim_amt_col.number_input(
         "投資金額", min_value=0.0, value=0.0, step=1000.0,
