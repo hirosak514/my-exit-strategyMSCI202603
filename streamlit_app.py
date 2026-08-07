@@ -150,6 +150,42 @@ def overwrite_backup_at_index(idx, data):
         st.error(f"上書き失敗: {e}")
         return None
 
+def delete_backup_at_index(idx):
+    """
+    絶対インデックス idx の行をスプレッドシートから削除する。
+    - 主：セッションに保持している idx（=行番号-1）から直接特定
+    - 副：削除直前に実際のタイムスタンプとキャッシュ上のタイムスタンプを照合し、
+          ズレていれば列A全体を検索してフォールバックする
+    戻り値: 成功時は True、失敗時は False
+    """
+    gc = get_gspread_client()
+    if not gc: return False
+    try:
+        sh = gc.open_by_url(FIXED_SHEET_URL)
+        ws = sh.get_worksheet(0)
+        ensure_header(ws)
+
+        cached_entry = st.session_state.backup_cache.get(idx)
+        expected_ts = cached_entry["timestamp"] if cached_entry else None
+        row_number = idx + 1  # +1 はヘッダー行分
+
+        actual_row = ws.row_values(row_number)
+        actual_ts = actual_row[0] if actual_row else None
+
+        if expected_ts and actual_ts != expected_ts:
+            col = ws.col_values(1)
+            try:
+                row_number = col.index(expected_ts) + 1
+            except ValueError:
+                st.error("削除対象のバックアップがシート上に見つかりませんでした（既に削除された可能性があります）。")
+                return False
+
+        ws.delete_rows(row_number)
+        return True
+    except Exception as e:
+        st.error(f"削除失敗: {e}")
+        return False
+
 def export_to_spreadsheet(data):
     """新規バックアップを1行追記する（上書きしない）。1000件超は古い順に削除。"""
     gc = get_gspread_client()
@@ -905,10 +941,32 @@ with st.sidebar:
     st.markdown('<hr style="margin: 0.5rem 0;">', unsafe_allow_html=True)
     st.subheader("💾 Backup (Spreadsheet)")
     full_config = {"portfolio": st.session_state.portfolio, "events": st.session_state.events, "reminder_text": st.session_state.reminder_text}
-    
+
+    @st.dialog("確認")
+    def confirm_overwrite_dialog(data_to_write, target_idx):
+        st.write("データを上書きしますか？")
+        col_ok, col_cancel = st.columns(2)
+        if col_ok.button("OK", use_container_width=True):
+            written_ts = overwrite_backup_at_index(target_idx, data_to_write)
+            if written_ts:
+                entry = st.session_state.backup_cache.get(target_idx)
+                if entry:
+                    entry["data"] = data_to_write
+                try:
+                    display_ts = datetime.strptime(written_ts, TIMESTAMP_FMT).strftime(DISPLAY_FMT)
+                except Exception:
+                    display_ts = written_ts
+                st.session_state["_overwrite_success_msg"] = f"バックアップを上書きしました（{display_ts}）"
+            st.rerun()
+        if col_cancel.button("Cancel", use_container_width=True):
+            st.rerun()
+
     exp_col1, exp_col2 = st.columns(2)
     new_backup_clicked = exp_col1.button("🆕 新規バックアップ")
     overwrite_clicked = exp_col2.button("♻️ 上書きバックアップ")
+
+    if "_overwrite_success_msg" in st.session_state:
+        st.success(st.session_state.pop("_overwrite_success_msg"))
 
     if new_backup_clicked:
         export_to_spreadsheet(full_config)
@@ -917,17 +975,7 @@ with st.sidebar:
         if st.session_state.backup_index is None:
             st.warning("上書き対象が選択されていません。先に「◀ 1つ前の設定」で対象のバックアップを表示してください。")
         else:
-            written_ts = overwrite_backup_at_index(st.session_state.backup_index, full_config)
-            if written_ts:
-                # ローカルキャッシュも同時に更新しておく（表示との整合性を保つため）
-                entry = st.session_state.backup_cache.get(st.session_state.backup_index)
-                if entry:
-                    entry["data"] = full_config
-                try:
-                    display_ts = datetime.strptime(written_ts, TIMESTAMP_FMT).strftime(DISPLAY_FMT)
-                except Exception:
-                    display_ts = written_ts
-                st.success(f"バックアップを上書きしました（{display_ts}）")
+            confirm_overwrite_dialog(full_config, st.session_state.backup_index)
 
     # --- キャッシュ強制更新（他デバイスでの変更等をスプレッドシートから読み直す） ---
     if st.button("🔄 スプレッドシートを再読み込み"):
@@ -1099,7 +1147,7 @@ def simulate_equal_investment(total_amount, input_currency, prices_dict, rate):
 
     return True, result_shares, 0
 
-col_refresh, col_ts = st.columns([1, 3])
+col_refresh, col_ts, col_delete = st.columns([1, 2, 1])
 if col_refresh.button('最新価格に更新'):
     # キャッシュを明示的に破棄してから再実行（手動更新は必ず最新値を取りに行く）
     _fetch_prices_cached.clear()
@@ -1108,6 +1156,37 @@ if col_refresh.button('最新価格に更新'):
 prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys(), td_api_key=current_twelvedata_key)
 col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（15分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
+
+@st.dialog("確認")
+def confirm_delete_sheet_dialog(target_idx):
+    st.write("現在表示中のバックアップと、対応するスプレッドシートのデータを削除しますか？")
+    st.caption("この操作は元に戻せません。")
+    col_ok, col_cancel = st.columns(2)
+    if col_ok.button("OK", use_container_width=True):
+        deleted = delete_backup_at_index(target_idx)
+        if deleted:
+            # ローカルの表示状態・キャッシュを破棄し、live編集用のportfolioに戻す
+            st.session_state.portfolio = load_json(DB_FILE, {})
+            st.session_state.events = load_json(EVENT_FILE, [])
+            st.session_state.reminder_text = load_json(REMINDER_FILE, "- ターゲット日程を入力してください")
+            st.session_state.backup_cache = {}
+            st.session_state.cache_min = None
+            st.session_state.cache_max = None
+            st.session_state.backup_total = None
+            st.session_state.backup_index = None
+            st.session_state["_delete_success_msg"] = "削除しました。データを再読み込みしました。"
+        st.rerun()
+    if col_cancel.button("Cancel", use_container_width=True):
+        st.rerun()
+
+if col_delete.button("🗑️ シート削除", use_container_width=True):
+    if st.session_state.backup_index is None:
+        st.warning("削除対象が選択されていません。先に「◀ 1つ前の設定」で対象のバックアップを表示してください。")
+    else:
+        confirm_delete_sheet_dialog(st.session_state.backup_index)
+
+if "_delete_success_msg" in st.session_state:
+    st.success(st.session_state.pop("_delete_success_msg"))
 
 # --- 仮想注文パネル（PC幅では画面右下に固定表示、スマホ幅では通常フロー） ---
 with st.container(key="floating_sim_panel"):
