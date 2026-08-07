@@ -925,6 +925,19 @@ with st.sidebar:
                     display_ts = written_ts
                 st.success(f"バックアップを上書きしました（{display_ts}）")
 
+    # --- キャッシュ強制更新（他デバイスでの変更等をスプレッドシートから読み直す） ---
+    if st.button("🔄 スプレッドシートを再読み込み（キャッシュ更新）"):
+        st.session_state.backup_cache = {}
+        st.session_state.cache_min = None
+        st.session_state.cache_max = None
+        if st.session_state.backup_index is not None:
+            # 現在表示中の位置を保ったまま、その周辺を最新の内容で読み直す
+            load_backup_window(center_idx=st.session_state.backup_index)
+        else:
+            load_backup_window(initial=True)
+        st.success("スプレッドシートを再読み込みしました")
+        st.rerun()
+
     # --- 前後ナビゲーション ---
     nav_col1, nav_col2 = st.columns(2)
     prev_clicked = nav_col1.button("◀ 1つ前の設定")
