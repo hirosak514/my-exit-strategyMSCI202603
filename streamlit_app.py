@@ -1,7 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import google.generativeai as genai
 from PIL import Image
 import json
@@ -10,6 +10,11 @@ import os
 import copy
 import gspread
 from google.oauth2.service_account import Credentials
+import csv
+from streamlit_autorefresh import st_autorefresh
+import streamlit.components.v1 as components
+import time
+import requests
 
 # --- 0. データの保存・読み込み ---
 DB_FILE = "portfolio.json"
@@ -17,8 +22,23 @@ EVENT_FILE = "events.json"
 REMINDER_FILE = "reminder.json"
 CONFIG_FILE = "config.json"
 
+def now_jst():
+    """
+    サーバーの実行環境（Streamlit CloudなどはUTC）によらず、常に日本時間(JST)の
+    naive datetimeを返す。datetime.now()の代わりに、表示・タイムスタンプ保存用途では
+    こちらを使用する。
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=9)
+
 # 【改修箇所】対象のスプレッドシートURLをここに記述してください
 FIXED_SHEET_URL = "https://docs.google.com/spreadsheets/d/17kAFl14q8EaaQ6kvezlAe1Yzr71Yo673T61--_cyESQ/edit"
+
+# --- バックアップ履歴 設定 ---
+MAX_BACKUPS = 1000          # 保持する最大バックアップ件数（超えたら古い順に削除）
+INITIAL_CACHE_SIZE = 10     # 初回「1つ前の設定」で読み込む件数（直近N件）
+WINDOW_CACHE_RADIUS = 10    # 範囲外アクセス時に読み込む前後件数（前後N件＝計2N件）
+TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S"       # スプレッドシート保存用の内部フォーマット
+DISPLAY_FMT = "%Y年%m月%d日 %H:%M"         # ユーザー表示用のフォーマット
 
 def load_json(file_path, default_value):
     if os.path.exists(file_path):
@@ -34,7 +54,7 @@ def save_json(file_path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 # --- Google Spreadsheet 連携関数 ---
-def get_gspread_client():
+def get_gspread_client(silent=False):
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     try:
         # Streamlit secrets または環境変数から認証情報を取得
@@ -42,32 +62,201 @@ def get_gspread_client():
         credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         return gspread.authorize(credentials)
     except Exception as e:
-        st.error(f"Google認証に失敗しました: {e}")
+        if not silent:
+            st.error(f"Google認証に失敗しました: {e}")
         return None
 
-def export_to_spreadsheet(data):
-    gc = get_gspread_client()
-    if not gc: return
+def ensure_header(ws):
+    """A1セルが 'timestamp' でなければヘッダー行を先頭に挿入する"""
     try:
-        sh = gc.open_by_url(FIXED_SHEET_URL)
-        ws = sh.get_worksheet(0)
-        ws.clear()
-        ws.update('A1', [[json.dumps(data, ensure_ascii=False)]])
-        st.success("スプレッドシートへのエクスポートが完了しました")
-    except Exception as e:
-        st.error(f"エクスポート失敗: {e}")
+        first_cell = ws.acell("A1").value
+    except Exception:
+        first_cell = None
+    if first_cell != "timestamp":
+        # 旧形式（A1に直接JSONを書いていた版）が残っている場合、
+        # そのままだと2行目に旧データが紛れ込みます。事前に手動でシートを
+        # クリアしておくことを推奨します。
+        ws.insert_row(["timestamp", "data"], 1)
 
-def import_from_spreadsheet():
+def get_backup_count(ws):
+    """タイムスタンプ列（A列）だけを読み、件数を安価に取得する"""
+    try:
+        col = ws.col_values(1)  # ヘッダー込み
+        return max(0, len(col) - 1)
+    except Exception:
+        return 0
+
+def fetch_backup_range(ws, start_idx, end_idx, total):
+    """
+    絶対インデックス start_idx〜end_idx（1=最古 … total=最新）の
+    範囲だけをまとめて取得する。
+    """
+    start_idx = max(1, start_idx)
+    end_idx = min(total, end_idx)
+    if start_idx > end_idx:
+        return {}, start_idx, end_idx
+
+    start_row = start_idx + 1  # +1 はヘッダー行分
+    end_row = end_idx + 1
+    values = ws.get(f"A{start_row}:B{end_row}")
+
+    cache = {}
+    for offset, row in enumerate(values):
+        idx = start_idx + offset
+        if len(row) >= 2 and row[1]:
+            try:
+                cache[idx] = {"timestamp": row[0], "data": json.loads(row[1])}
+            except Exception:
+                continue
+    return cache, start_idx, end_idx
+
+def overwrite_backup_at_index(idx, data):
+    """
+    絶対インデックス idx の行を、新しい内容で上書きする。
+    - 主：セッションに保持している idx（=行番号-1）から直接特定
+    - 副：上書き直前に実際のタイムスタンプとキャッシュ上のタイムスタンプを照合し、
+          ズレていれば列A全体を検索してフォールバックする
+    戻り値: 成功時は書き込んだ行のタイムスタンプ文字列、失敗時は None
+    """
     gc = get_gspread_client()
     if not gc: return None
     try:
         sh = gc.open_by_url(FIXED_SHEET_URL)
         ws = sh.get_worksheet(0)
-        content = ws.acell('A1').value
-        return json.loads(content) if content else None
+        ensure_header(ws)
+
+        cached_entry = st.session_state.backup_cache.get(idx)
+        expected_ts = cached_entry["timestamp"] if cached_entry else None
+        row_number = idx + 1  # +1 はヘッダー行分
+
+        actual_row = ws.row_values(row_number)
+        actual_ts = actual_row[0] if actual_row else None
+
+        if expected_ts and actual_ts != expected_ts:
+            # 行がズレている可能性 → タイムスタンプで再検索してフォールバック
+            col = ws.col_values(1)
+            try:
+                row_number = col.index(expected_ts) + 1  # 1-based行番号（col[0]がヘッダー）
+            except ValueError:
+                st.error("上書き対象のバックアップがシート上に見つかりませんでした（削除された可能性があります）。"
+                          "「◀ 1つ前の設定」で対象を読み込み直してください。")
+                return None
+
+        # タイムスタンプは維持したまま、データ部分のみ上書きする
+        keep_ts = expected_ts or actual_ts or now_jst().strftime(TIMESTAMP_FMT)
+        ws.update(f"A{row_number}:B{row_number}", [[keep_ts, json.dumps(data, ensure_ascii=False)]])
+        return keep_ts
     except Exception as e:
-        st.error(f"インポート失敗: {e}")
+        st.error(f"上書き失敗: {e}")
         return None
+
+def export_to_spreadsheet(data):
+    """新規バックアップを1行追記する（上書きしない）。1000件超は古い順に削除。"""
+    gc = get_gspread_client()
+    if not gc: return
+    try:
+        sh = gc.open_by_url(FIXED_SHEET_URL)
+        ws = sh.get_worksheet(0)
+        ensure_header(ws)
+
+        timestamp = now_jst().strftime(TIMESTAMP_FMT)
+        ws.append_row([timestamp, json.dumps(data, ensure_ascii=False)])
+
+        total = get_backup_count(ws)
+        if total > MAX_BACKUPS:
+            excess = total - MAX_BACKUPS
+            # 2行目（最古データ）から excess 件分をまとめて削除
+            ws.delete_rows(2, 1 + excess)
+
+        display_ts = datetime.strptime(timestamp, TIMESTAMP_FMT).strftime(DISPLAY_FMT)
+        st.success(f"バックアップを保存しました（{display_ts}）")
+    except Exception as e:
+        st.error(f"エクスポート失敗: {e}")
+
+def preload_backup_cache():
+    """
+    アプリ起動時に一度だけ呼び出す。直近 INITIAL_CACHE_SIZE 件を先読みして
+    キャッシュしておくことで、初回の「1つ前の設定」操作をAPI呼び出しなしで
+    即座に反映できるようにする。ライブの portfolio には一切手を加えない。
+    """
+    gc = get_gspread_client(silent=True)  # 未設定環境でも起動時にエラーを出さない
+    if not gc:
+        return
+    try:
+        sh = gc.open_by_url(FIXED_SHEET_URL)
+        ws = sh.get_worksheet(0)
+        ensure_header(ws)
+
+        total = get_backup_count(ws)
+        st.session_state.backup_total = total
+        if total == 0:
+            return
+
+        start_idx = max(1, total - INITIAL_CACHE_SIZE + 1)
+        cache, s, e = fetch_backup_range(ws, start_idx, total, total)
+        if cache:
+            st.session_state.backup_cache = cache
+            st.session_state.cache_min = s
+            st.session_state.cache_max = e
+    except Exception:
+        # 起動時のプリロードはあくまで先読み最適化のためのものなので、
+        # 失敗してもアプリ本体の起動は妨げない（黙って諦める）
+        pass
+
+def load_backup_window(center_idx=None, initial=False):
+    """
+    initial=True: 直近 INITIAL_CACHE_SIZE 件を読み込み、最新（=1つ前）を適用
+    initial=False: center_idx の前後 WINDOW_CACHE_RADIUS 件（計最大2N件）を読み込む
+    """
+    gc = get_gspread_client()
+    if not gc: return
+    try:
+        sh = gc.open_by_url(FIXED_SHEET_URL)
+        ws = sh.get_worksheet(0)
+        ensure_header(ws)
+
+        total = get_backup_count(ws)
+        st.session_state.backup_total = total
+        if total == 0:
+            st.warning("バックアップ履歴が見つかりません")
+            return
+
+        if initial:
+            start_idx = max(1, total - INITIAL_CACHE_SIZE + 1)
+            end_idx = total
+            target_idx = total  # 最新 = "1つ前"の最初の到達点
+        else:
+            start_idx = max(1, center_idx - WINDOW_CACHE_RADIUS)
+            end_idx = min(total, center_idx + WINDOW_CACHE_RADIUS)
+            target_idx = center_idx
+
+        cache, s, e = fetch_backup_range(ws, start_idx, end_idx, total)
+        if not cache:
+            st.warning("該当する履歴データが見つかりませんでした")
+            return
+
+        st.session_state.backup_cache = cache
+        st.session_state.cache_min = s
+        st.session_state.cache_max = e
+        apply_backup_index(target_idx)
+    except Exception as e:
+        st.error(f"履歴取得失敗: {e}")
+
+def apply_backup_index(idx):
+    """キャッシュ済みの idx 番目のバックアップをセッションに反映する"""
+    entry = st.session_state.backup_cache.get(idx)
+    if not entry:
+        st.warning("そのデータはまだキャッシュされていません")
+        return
+    backup_portfolio()
+    data = entry["data"]
+    st.session_state.portfolio = data.get("portfolio", {})
+    st.session_state.events = data.get("events", [])
+    st.session_state.reminder_text = data.get("reminder_text", "")
+    st.session_state.backup_index = idx
+    save_json(DB_FILE, st.session_state.portfolio)
+    save_json(EVENT_FILE, st.session_state.events)
+    save_json(REMINDER_FILE, st.session_state.reminder_text)
 
 # --- 1. セッション状態の初期化 ---
 if 'portfolio' not in st.session_state:
@@ -80,6 +269,26 @@ if 'reminder_text' not in st.session_state:
     st.session_state.reminder_text = load_json(REMINDER_FILE, "- ターゲット日程を入力してください")
 if 'api_key' not in st.session_state:
     st.session_state.api_key = load_json(CONFIG_FILE, {"gemini_key": ""}).get("gemini_key", "")
+if 'twelvedata_key' not in st.session_state:
+    st.session_state.twelvedata_key = load_json(CONFIG_FILE, {}).get("twelvedata_key", "")
+# --- バックアップ履歴（前後移動）用の状態 ---
+if 'backup_cache' not in st.session_state:
+    st.session_state.backup_cache = {}      # {絶対インデックス: {"timestamp":..., "data":...}}
+if 'cache_min' not in st.session_state:
+    st.session_state.cache_min = None
+if 'cache_max' not in st.session_state:
+    st.session_state.cache_max = None
+if 'backup_index' not in st.session_state:
+    st.session_state.backup_index = None    # 現在表示中の絶対インデックス（1=最古）
+if 'backup_total' not in st.session_state:
+    st.session_state.backup_total = None
+if 'startup_backup_preloaded' not in st.session_state:
+    st.session_state.startup_backup_preloaded = False
+
+if not st.session_state.startup_backup_preloaded:
+    # アプリ起動時に一度だけ、直近のバックアップ履歴を先読みしてキャッシュしておく
+    preload_backup_cache()
+    st.session_state.startup_backup_preloaded = True
 
 # 復元用バックアップ
 def backup_portfolio():
@@ -90,33 +299,346 @@ current_api_key = st.session_state.api_key or st.secrets.get("GEMINI_API_KEY", "
 if current_api_key:
     genai.configure(api_key=current_api_key)
 
+current_twelvedata_key = st.session_state.twelvedata_key or st.secrets.get("TWELVEDATA_API_KEY", "")
+
 # --- 3. 解析・価格取得関数 ---
-def get_live_prices(portfolio_keys):
+def search_and_add_stock(query, add_type_label, shares, cost):
+    """
+    証券コード または 銘柄名 で検索し、見つかれば portfolio に新規追加する。
+    戻り値: 成功時は追加したキー文字列、失敗時は None
+    """
+    type_suffix = {"現物": "", "信用(買建)": "_MARGIN_LONG", "信用(売建)": "_SHORT"}.get(add_type_label, "")
+    q = query.strip()
+    if not q:
+        return None
+
+    candidates = []  # (表示コード, yfinanceティッカー, 通貨)
+    if q.isdigit() and len(q) == 4:
+        candidates.append((q, f"{q}.T", "JPY"))
+    candidates.append((q.upper(), q.upper(), "USD"))
+
+    # 1. コード直接指定として試す
+    for code, ticker, currency in candidates:
+        try:
+            info = yf.Ticker(ticker).info
+            name = info.get("shortName") or info.get("longName")
+            price = info.get("regularMarketPrice") or info.get("previousClose")
+            if name and price:
+                key = f"{code}{type_suffix}"
+                st.session_state.portfolio[key] = {
+                    "name": name, "shares": shares, "cost": cost, "currency": currency
+                }
+                return key
+        except Exception:
+            continue
+
+    # 2. 直接指定で見つからなければ、銘柄名によるあいまい検索
+    try:
+        search_result = yf.Search(q, max_results=5)
+        quotes = getattr(search_result, "quotes", []) or []
+        for item in quotes:
+            symbol = item.get("symbol")
+            name = item.get("shortname") or item.get("longname")
+            if not symbol:
+                continue
+            is_japan = symbol.endswith(".T")
+            code = symbol.replace(".T", "") if is_japan else symbol
+            currency = "JPY" if is_japan else "USD"
+            key = f"{code}{type_suffix}"
+            st.session_state.portfolio[key] = {
+                "name": name or code, "shares": shares, "cost": cost, "currency": currency
+            }
+            return key
+    except Exception:
+        pass
+
+    return None
+
+def parse_stock_csv(uploaded_file):
+    """
+    1行目が '#' で始まるコメント行（例: # トレンド銘柄...,保存日時:...,市場:jp）の場合はスキップし、
+    'code,name' ヘッダーを持つCSVから銘柄コード・銘柄名のリストを抽出する。
+    戻り値: [(code, name), ...]
+    """
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        text = raw.decode('shift_jis', errors='ignore')
+
+    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith('#')]
+    if not lines:
+        return []
+
+    reader = csv.DictReader(lines)
+    # ヘッダーの大文字小文字・前後空白ゆれを吸収
+    fieldmap = {(f or '').strip().lower(): f for f in (reader.fieldnames or [])}
+    code_field = fieldmap.get('code')
+    name_field = fieldmap.get('name')
+
+    results = []
+    for row in reader:
+        code = (row.get(code_field) or '').strip() if code_field else ''
+        name = (row.get(name_field) or '').strip() if name_field else ''
+        if code:
+            results.append((code, name))
+    return results
+
+def build_entries_from_csv(rows, default_shares=100):
+    """
+    [(code, name), ...] から portfolio 用のエントリ辞書を作る。
+    価格は現在株価を自動取得（取得できない場合は0）。区分は「現物」固定。
+    """
+    entries = {}
+    for code, name in rows:
+        is_japan = code.isdigit() and len(code) == 4
+        ticker = f"{code}.T" if is_japan else ("7013.T" if code == "IHI" else code.upper())
+        currency = "JPY" if is_japan else "USD"
+
+        price = 0.0
+        try:
+            hist = yf.Ticker(ticker).history(period="5d")
+            if not hist.empty:
+                price = float(hist['Close'].iloc[-1])
+        except Exception:
+            price = 0.0
+
+        key = f"{code}_現物"
+        entries[key] = {
+            "name": name or code,
+            "shares": default_shares,
+            "cost": round(price, 2),
+            "currency": currency
+        }
+    return entries
+
+TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
+
+def build_twelvedata_symbol(portfolio_key):
+    """内部の portfolio キー（例: '7203_現物'）から Twelve Data 用のシンボル文字列を作る"""
+    code = portfolio_key.split('_')[0]
+    is_japan = code.isdigit() and len(code) == 4
+    if code == "IHI":
+        return "7013:TSE"
+    if is_japan:
+        return f"{code}:TSE"
+    return code.upper()
+
+def fetch_twelvedata_quotes(portfolio_keys, api_key):
+    """
+    Twelve Data の /quote エンドポイントで複数銘柄をまとめて取得する。
+    戻り値: {portfolio_key: {"current":..., "prev_close":...}} （取得できたものだけを含む）
+    取得できなかった銘柄はこの戻り値に含まれないので、呼び出し元でYahooにフォールバックする。
+    """
+    if not api_key or not portfolio_keys:
+        return {}
+
+    key_to_symbol = {k: build_twelvedata_symbol(k) for k in portfolio_keys}
+    symbol_to_keys = {}
+    for k, sym in key_to_symbol.items():
+        symbol_to_keys.setdefault(sym, []).append(k)
+
+    symbols = list(symbol_to_keys.keys())
+    results = {}
+
+    CHUNK = 100  # Twelve Dataは1リクエストあたり最大120銘柄まで対応（余裕を持たせる）
+    for i in range(0, len(symbols), CHUNK):
+        chunk_symbols = symbols[i:i + CHUNK]
+        params = {"symbol": ",".join(chunk_symbols), "apikey": api_key}
+        try:
+            resp = requests.get(f"{TWELVEDATA_BASE_URL}/quote", params=params, timeout=10)
+            data = resp.json()
+        except Exception:
+            continue  # このチャンクは全滅 → 呼び出し元でYahooにフォールバックされる
+
+        # 単一銘柄の場合は結果がそのままdictで返り、複数銘柄の場合はsymbolをキーにしたdict of dictで返る
+        if isinstance(data, dict) and "symbol" in data:
+            entries = {data.get("symbol"): data}
+        elif isinstance(data, dict):
+            entries = data
+        else:
+            entries = {}
+
+        for sym, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") == "error" or "close" not in entry:
+                continue
+            try:
+                cur = float(entry["close"])
+            except (TypeError, ValueError):
+                continue
+            prev = entry.get("previous_close")
+            try:
+                prev = float(prev) if prev is not None else None
+            except (TypeError, ValueError):
+                prev = None
+
+            matched_keys = symbol_to_keys.get(sym)
+            if not matched_keys:
+                # レスポンスのsymbol表記が微妙に異なる場合（例: "7203:TSE" vs "7203"）への保険
+                base = str(sym).split(':')[0]
+                for cand_sym, ks in symbol_to_keys.items():
+                    if cand_sym.split(':')[0] == base:
+                        matched_keys = ks
+                        break
+            if matched_keys:
+                for k in matched_keys:
+                    results[k] = {"current": cur, "prev_close": prev}
+
+    return results
+
+def get_live_prices(portfolio_keys, td_api_key=None):
     prices = {}
+    fetch_errors = {}   # デバッグ用：銘柄ごとの失敗理由を記録
+    fetch_debug = {}    # デバッグ用：成功時も含め、取得元・値を記録
+    portfolio_keys = list(portfolio_keys)
+
+    # --- 0. まず Twelve Data でまとめて取得を試す（設定されている場合のみ） ---
+    td_results = {}
+    if td_api_key:
+        try:
+            td_results = fetch_twelvedata_quotes(portfolio_keys, td_api_key)
+        except Exception as e:
+            fetch_errors["_twelvedata"] = f"{type(e).__name__}: {e}"
+
     for key in portfolio_keys:
+        if key in td_results:
+            prices[key] = td_results[key]
+            fetch_debug[key] = f"[twelvedata] 現在値={td_results[key]['current']} 前日終値={td_results[key]['prev_close']}"
+            continue  # Twelve Dataで取得できた銘柄はYahooに問い合わせない
+
         symbol = key.split('_')[0]
         is_japan = symbol.isdigit() and len(symbol) == 4
         ticker = f"{symbol}.T" if is_japan else ("7013.T" if symbol == "IHI" else symbol)
-        
+
+        got_price = False
+
+        # --- 1. .info（v7/finance/quote エンドポイント）を最優先で試す ---
+        # (get_history_metadata / fast_info / history は、実は全て同じ「チャート用API」を
+        #  内部で共有しており、見た目は別ルートでも実体は同一データだった。
+        #  .info は quoteSummary + v7/finance/quote という完全に別のAPIを叩くため、
+        #  ここでようやく本当に独立した気配値が期待できる。ただし重い呼び出しなので
+        #  失敗時は下位のフォールバックに切り替える)
         try:
             stock = yf.Ticker(ticker)
-            hist = stock.history(period="5d")
-            if not hist.empty:
-                prices[key] = {
-                    "current": hist['Close'].iloc[-1],
-                    "prev_close": hist['Close'].iloc[-2] if len(hist) >= 2 else None
-                }
-            else:
+            info = stock.info
+            cur = info.get("regularMarketPrice") if info else None
+            if cur is None and info:
+                cur = info.get("currentPrice")
+            prev = info.get("regularMarketPreviousClose") if info else None
+            if prev is None and info:
+                prev = info.get("previousClose")
+            if cur is not None and not pd.isna(cur):
+                prices[key] = {"current": cur, "prev_close": prev}
+                fetch_debug[key] = f"[info] 現在値={cur} 前日終値={prev}"
+                got_price = True
+        except Exception as e:
+            fetch_errors[key] = f"[info] {type(e).__name__}: {e}"
+
+        # --- 2. .info が使えない場合は get_history_metadata() の regularMarketPrice を試す ---
+        # (fast_info.last_price は内部的に history() の日足終値をそのまま使っているだけで、
+        #  実は取引時間中でも更新されないことが判明。regularMarketPrice は
+        #  Yahoo Financeが返す実際の気配値そのものなので、historyの日足よりは新しいはず)
+        if not got_price:
+            try:
+                stock = yf.Ticker(ticker)
+                md = stock.get_history_metadata()
+                cur = md.get("regularMarketPrice") if md else None
+                prev = md.get("chartPreviousClose") if md else None
+                if prev is None and md:
+                    prev = md.get("previousClose")
+                if cur is not None and not pd.isna(cur):
+                    prices[key] = {"current": cur, "prev_close": prev}
+                    fetch_debug[key] = f"[metadata] 現在値={cur} 前日終値={prev}"
+                    got_price = True
+            except Exception as e:
+                fetch_errors[key] = fetch_errors.get(key, "") + f" / [metadata] {type(e).__name__}: {e}"
+
+        if not got_price:
+            # --- 3. metadataも使えない場合は fast_info を試す ---
+            try:
+                stock = yf.Ticker(ticker)
+                fi = stock.fast_info
+                cur = fi.get("lastPrice") if fi else None
+                prev = fi.get("previousClose") if fi else None
+                if cur is not None and not pd.isna(cur):
+                    prices[key] = {"current": cur, "prev_close": prev}
+                    fetch_debug[key] = f"[fast_info] 現在値={cur:.2f} 前日終値={prev}"
+                    got_price = True
+            except Exception as e:
+                fetch_errors[key] = fetch_errors.get(key, "") + f" / [fast_info] {type(e).__name__}: {e}"
+
+        if not got_price:
+            # --- 4. それでもダメなら従来の日足取得にフォールバック ---
+            try:
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period="5d")
+                if not hist.empty:
+                    last_close = hist['Close'].iloc[-1]
+                    last_dt = hist.index[-1]
+                    prices[key] = {
+                        "current": last_close,
+                        "prev_close": hist['Close'].iloc[-2] if len(hist) >= 2 else None
+                    }
+                    fetch_debug[key] = f"[history フォールバック] {last_dt} 終値={last_close:.2f}（{len(hist)}本取得）"
+                    got_price = True
+                else:
+                    prices[key] = None
+                    fetch_errors[key] = fetch_errors.get(key, "") + " / 空のデータが返されました（レート制限の可能性）"
+            except Exception as e:
                 prices[key] = None
-        except:
-            prices[key] = None
-            
-    try:
-        usdjpy = yf.Ticker("JPY=X").history(period="5d")
-        prices["USDJPY"] = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
-    except:
-        prices["USDJPY"] = 159.2
+                fetch_errors[key] = fetch_errors.get(key, "") + f" / [history] {type(e).__name__}: {e}"
+
+        time.sleep(0.3)  # .info は複数リクエストが飛ぶ重い呼び出しのため、間隔を少し長めに
+
+    # --- USD/JPY為替レートもTwelve Data優先、ダメならYahooにフォールバック ---
+    usdjpy_from_td = None
+    if td_api_key:
+        try:
+            resp = requests.get(f"{TWELVEDATA_BASE_URL}/quote", params={"symbol": "USD/JPY", "apikey": td_api_key}, timeout=10)
+            fx_data = resp.json()
+            if isinstance(fx_data, dict) and fx_data.get("status") != "error" and "close" in fx_data:
+                usdjpy_from_td = float(fx_data["close"])
+        except Exception as e:
+            fetch_errors["USDJPY"] = f"[twelvedata] {type(e).__name__}: {e}"
+
+    if usdjpy_from_td is not None:
+        prices["USDJPY"] = usdjpy_from_td
+    else:
+        try:
+            usdjpy_md = yf.Ticker("JPY=X").get_history_metadata()
+            prices["USDJPY"] = usdjpy_md.get("regularMarketPrice", 159.2) if usdjpy_md else 159.2
+        except Exception:
+            try:
+                usdjpy = yf.Ticker("JPY=X").history(period="5d")
+                prices["USDJPY"] = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
+            except Exception as e:
+                prices["USDJPY"] = 159.2
+                fetch_errors["USDJPY"] = fetch_errors.get("USDJPY", "") + f" / {type(e).__name__}: {e}"
+
+    prices["_fetch_errors"] = fetch_errors
+    prices["_fetch_debug"] = fetch_debug
     return prices
+
+PRICE_CACHE_TTL_SECONDS = 900  # 15分
+
+@st.cache_data(ttl=PRICE_CACHE_TTL_SECONDS, show_spinner=False)
+def _fetch_prices_cached(keys_tuple, td_api_key):
+    """get_live_prices の結果を15分間キャッシュする。取得時刻も併せて返す。"""
+    prices = get_live_prices(list(keys_tuple), td_api_key=td_api_key)
+    return prices, now_jst()
+
+def get_prices_with_cache(portfolio_keys, td_api_key=None):
+    """
+    ポートフォリオのキー集合から価格を取得する（15分キャッシュ付き）。
+    戻り値: (prices_dict, last_updated_datetime)
+    """
+    keys_tuple = tuple(sorted(portfolio_keys))
+    if not keys_tuple:
+        return {"USDJPY": 159.2}, now_jst()
+    return _fetch_prices_cached(keys_tuple, td_api_key)
 
 # 【オリジナルを完全踏襲】
 def analyze_multiple_images(uploaded_files):
@@ -171,38 +693,135 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# --- キーボードショートカット（← → で バックアップ履歴を前後に移動） ---
+components.html("""
+<script>
+(function() {
+    function tryInstall() {
+        let doc;
+        try {
+            doc = window.parent.document;
+        } catch (err) {
+            return false; // 親フレームがまだ準備できていない → 後でリトライ
+        }
+        if (!doc) { return false; }
+        // 複数回のrerunや複数回のリトライでリスナーが重複登録されるのを防ぐためのフラグ
+        if (doc.__backupNavKeyListenerInstalled) { return true; }
+
+        function clickButtonByText(text) {
+            const buttons = Array.from(doc.querySelectorAll('button'));
+            const target = buttons.find(btn => btn.innerText.trim() === text);
+            if (target) { target.click(); }
+        }
+
+        doc.addEventListener('keydown', function(e) {
+            const active = doc.activeElement;
+            const tag = active ? active.tagName.toLowerCase() : '';
+            // 入力欄にフォーカスがある間は矢印キー本来の動作（カーソル移動等）を妨げない
+            if (tag === 'input' || tag === 'textarea' || (active && active.isContentEditable)) {
+                return;
+            }
+            if (e.key === 'ArrowRight') {
+                clickButtonByText('1つ後の設定 ▶');
+                e.preventDefault();
+            } else if (e.key === 'ArrowLeft') {
+                clickButtonByText('◀ 1つ前の設定');
+                e.preventDefault();
+            }
+        });
+
+        doc.__backupNavKeyListenerInstalled = true;
+        return true;
+    }
+
+    // 起動直後は親フレームの準備が間に合わずインストールに失敗することがあるため、
+    // 成功するまで短い間隔でリトライする（最大 約5秒間）
+    if (!tryInstall()) {
+        let attempts = 0;
+        const maxAttempts = 20; // 250ms × 20 = 5秒
+        const retryTimer = setInterval(function() {
+            attempts++;
+            if (tryInstall() || attempts >= maxAttempts) {
+                clearInterval(retryTimer);
+            }
+        }, 250);
+    }
+})();
+</script>
+""", height=0)
+
 with st.sidebar:
     st.header("🔑 Settings")
     new_api_key = st.text_input("Gemini API Key", value=st.session_state.api_key, type="password")
     if st.button("APIキーを保存"):
         st.session_state.api_key = new_api_key
-        save_json(CONFIG_FILE, {"gemini_key": new_api_key})
+        cfg = load_json(CONFIG_FILE, {})
+        cfg["gemini_key"] = new_api_key
+        save_json(CONFIG_FILE, cfg)
         st.success("APIキーを保存しました")
+        st.rerun()
+
+    new_td_key = st.text_input("Twelve Data API Key", value=st.session_state.twelvedata_key, type="password",
+                                help="株価取得の第一候補として使用します。未設定・取得失敗時はYahoo Financeにフォールバックします。")
+    if st.button("Twelve Data APIキーを保存"):
+        st.session_state.twelvedata_key = new_td_key
+        cfg = load_json(CONFIG_FILE, {})
+        cfg["twelvedata_key"] = new_td_key
+        save_json(CONFIG_FILE, cfg)
+        st.success("Twelve Data APIキーを保存しました")
         st.rerun()
 
     st.divider()
 
     st.header("✏️ 銘柄情報の直接入力")
-    portfolio_items = list(st.session_state.portfolio.keys())
-    selected_no = None
-    if portfolio_items:
-        no_options = [i + 1 for i in range(len(portfolio_items))]
-        selected_no = st.selectbox("銘柄No.を選択", options=no_options)
-        target_key = portfolio_items[selected_no - 1]
-        target_info = st.session_state.portfolio[target_key]
-        new_shares = st.number_input(f"数量 ({target_key})", value=float(target_info.get('shares', 0)))
-        new_cost = st.number_input(f"取得単価 ({target_key})", value=float(target_info.get('cost', 0)))
+
+    new_symbol_query = st.text_input(
+        "🔍 銘柄コード/名称で新規追加（入力時のみ有効）",
+        value="", key="add_stock_query",
+        placeholder="例：7203 / NVDA / トヨタ"
+    )
+    add_mode = bool(new_symbol_query.strip())
+
+    if add_mode:
+        add_type = st.selectbox("区分", ["現物", "信用(買建)", "信用(売建)"], key="add_stock_type")
+        new_shares = st.number_input("数量（新規）", value=0.0, min_value=0.0, key="add_stock_shares")
+        new_cost = st.number_input("取得単価（新規）", value=0.0, min_value=0.0, key="add_stock_cost")
+        selected_no = None
+        target_key = None
     else:
-        st.info("編集する銘柄がありません")
-        new_shares, new_cost = 0.0, 0.0
+        portfolio_items = list(st.session_state.portfolio.keys())
+        selected_no = None
+        if portfolio_items:
+            no_options = [i + 1 for i in range(len(portfolio_items))]
+            selected_no = st.selectbox("銘柄No.を選択", options=no_options)
+            target_key = portfolio_items[selected_no - 1]
+            target_info = st.session_state.portfolio[target_key]
+            new_shares = st.number_input(f"数量 ({target_key})", value=float(target_info.get('shares', 0)))
+            new_cost = st.number_input(f"取得単価 ({target_key})", value=float(target_info.get('cost', 0)))
+        else:
+            st.info("編集する銘柄がありません")
+            new_shares, new_cost = 0.0, 0.0
+            target_key = None
 
     btn_col1, btn_col2, btn_col3 = st.columns(3)
     mod_ready = btn_col1.button("修正")
     rev_ready = btn_col2.button("復元", type="primary")
     del_ready = btn_col3.button("削除")
 
-    if selected_no:
-        if mod_ready:
+    if mod_ready:
+        if add_mode:
+            with st.spinner(f"「{new_symbol_query}」を検索中..."):
+                backup_portfolio()
+                added_key = search_and_add_stock(new_symbol_query, add_type, new_shares, new_cost)
+            if added_key:
+                save_json(DB_FILE, st.session_state.portfolio)
+                st.success(f"銘柄「{added_key}」を追加しました")
+                del st.session_state["add_stock_query"]
+                st.rerun()
+            else:
+                st.session_state.prev_portfolio = None  # 追加失敗時はバックアップを取り消す
+                st.error(f"「{new_symbol_query}」に該当する銘柄が見つかりませんでした")
+        elif selected_no:
             backup_portfolio()
             if new_shares == 0:
                 st.session_state.portfolio[target_key]['shares'] = 0
@@ -213,16 +832,19 @@ with st.sidebar:
             save_json(DB_FILE, st.session_state.portfolio)
             st.rerun()
 
-        if rev_ready:
-            if st.session_state.prev_portfolio is not None:
-                st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
-                st.session_state.prev_portfolio = None
-                save_json(DB_FILE, st.session_state.portfolio)
-                st.rerun()
-            else:
-                st.error("復元できる履歴がありません")
+    if rev_ready:
+        if st.session_state.prev_portfolio is not None:
+            st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
+            st.session_state.prev_portfolio = None
+            save_json(DB_FILE, st.session_state.portfolio)
+            st.rerun()
+        else:
+            st.error("復元できる履歴がありません")
 
-        if del_ready:
+    if del_ready:
+        if add_mode:
+            st.warning("削除は既存銘柄を選択している場合のみ有効です")
+        elif selected_no:
             backup_portfolio()
             del st.session_state.portfolio[target_key]
             save_json(DB_FILE, st.session_state.portfolio)
@@ -257,91 +879,324 @@ with st.sidebar:
     st.subheader("💾 Backup (Spreadsheet)")
     full_config = {"portfolio": st.session_state.portfolio, "events": st.session_state.events, "reminder_text": st.session_state.reminder_text}
     
-    # 【改修箇所】固定URLを使用するように変更
-    if st.button("設定をエクスポート"):
+    exp_col1, exp_col2 = st.columns(2)
+    new_backup_clicked = exp_col1.button("🆕 新規バックアップ")
+    overwrite_clicked = exp_col2.button("♻️ 上書きバックアップ")
+
+    if new_backup_clicked:
         export_to_spreadsheet(full_config)
 
-    if st.button("設定をインポート"):
-        imported_data = import_from_spreadsheet()
-        if imported_data:
-            backup_portfolio()
-            st.session_state.portfolio = imported_data.get("portfolio", {})
-            st.session_state.events = imported_data.get("events", [])
-            st.session_state.reminder_text = imported_data.get("reminder_text", "")
-            save_json(DB_FILE, st.session_state.portfolio)
-            save_json(EVENT_FILE, st.session_state.events)
-            save_json(REMINDER_FILE, st.session_state.reminder_text)
-            st.success("インポート完了")
-            st.rerun()
+    if overwrite_clicked:
+        if st.session_state.backup_index is None:
+            st.warning("上書き対象が選択されていません。先に「◀ 1つ前の設定」で対象のバックアップを表示してください。")
+        else:
+            written_ts = overwrite_backup_at_index(st.session_state.backup_index, full_config)
+            if written_ts:
+                # ローカルキャッシュも同時に更新しておく（表示との整合性を保つため）
+                entry = st.session_state.backup_cache.get(st.session_state.backup_index)
+                if entry:
+                    entry["data"] = full_config
+                try:
+                    display_ts = datetime.strptime(written_ts, TIMESTAMP_FMT).strftime(DISPLAY_FMT)
+                except Exception:
+                    display_ts = written_ts
+                st.success(f"バックアップを上書きしました（{display_ts}）")
+
+    # --- 前後ナビゲーション ---
+    nav_col1, nav_col2 = st.columns(2)
+    prev_clicked = nav_col1.button("◀ 1つ前の設定")
+    next_clicked = nav_col2.button("1つ後の設定 ▶")
+
+    if prev_clicked:
+        if st.session_state.backup_index is None:
+            if st.session_state.cache_min is not None and st.session_state.backup_total:
+                # 起動時にプリロード済みのキャッシュをそのまま使う（API呼び出し不要）
+                apply_backup_index(st.session_state.backup_total)
+            else:
+                # プリロードが未実施・失敗していた場合のフォールバック
+                load_backup_window(initial=True)
+        else:
+            target = st.session_state.backup_index - 1
+            if target < 1:
+                st.warning("これ以上前の履歴はありません")
+            elif target < st.session_state.cache_min:
+                load_backup_window(center_idx=target)
+            else:
+                apply_backup_index(target)
+        st.rerun()
+
+    if next_clicked:
+        if st.session_state.backup_index is None:
+            st.info("先に「◀ 1つ前の設定」を押してください")
+        else:
+            total = st.session_state.backup_total or st.session_state.backup_index
+            target = st.session_state.backup_index + 1
+            if target > total:
+                st.warning("これより新しい履歴はありません（最新のバックアップです）")
+            elif target > st.session_state.cache_max:
+                load_backup_window(center_idx=target)
+            else:
+                apply_backup_index(target)
+        st.rerun()
+
+    # --- 現在表示中のバックアップ日時を表示 ---
+    if st.session_state.backup_index is not None:
+        entry = st.session_state.backup_cache.get(st.session_state.backup_index)
+        if entry:
+            try:
+                dt = datetime.strptime(entry["timestamp"], TIMESTAMP_FMT)
+                display_ts = dt.strftime(DISPLAY_FMT)
+            except Exception:
+                display_ts = entry["timestamp"]
+            total_disp = st.session_state.backup_total or "?"
+            st.caption(f"📅 表示中のバックアップ：**{display_ts}**（{st.session_state.backup_index} / {total_disp} 件目）")
+
+    st.divider()
+    st.header("📄 CSV読み込み")
+    csv_file = st.file_uploader(
+        "銘柄リストCSVをアップロード（ドラッグ&ドロップ可）",
+        type=["csv"], key="csv_uploader"
+    )
+    csv_mode = st.radio(
+        "読み込み方法",
+        ["現在の画面に追加", "新規リストとして作成（既存を置き換え）"],
+        key="csv_mode"
+    )
+    if st.button("csv読み込み"):
+        if csv_file:
+            with st.spinner("CSVを解析し、現在株価を取得中..."):
+                try:
+                    rows = parse_stock_csv(csv_file)
+                    if not rows:
+                        st.warning("CSVから銘柄を読み取れませんでした。フォーマットをご確認ください。")
+                    else:
+                        new_entries = build_entries_from_csv(rows, default_shares=100)
+                        backup_portfolio()
+                        if csv_mode == "現在の画面に追加":
+                            st.session_state.portfolio.update(new_entries)
+                        else:
+                            st.session_state.portfolio = new_entries
+                        save_json(DB_FILE, st.session_state.portfolio)
+                        st.success(f"{len(new_entries)}件の銘柄を読み込みました")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"CSV読み込みエラー: {e}")
+        else:
+            st.warning("CSVファイルがアップロードされていません。")
 
     st.divider()
     st.header("📸 AI Scanner")
     up_files = st.file_uploader("証券口座のスクショをアップロード", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-    if up_files and st.button("AI解析実行"):
-        with st.spinner("AIが銘柄を抽出中..."):
-            try:
-                extracted_data = analyze_multiple_images(up_files)
-                backup_portfolio()
-                st.session_state.portfolio = extracted_data
-                save_json(DB_FILE, st.session_state.portfolio)
-                st.rerun()
-            except Exception as e: st.error(f"エラー: {e}")
+    # 【改修３】解析ボタンを常に表示（if文の構造を変更）
+    if st.button("AI解析実行"):
+        if up_files:
+            with st.spinner("AIが銘柄を抽出中..."):
+                try:
+                    extracted_data = analyze_multiple_images(up_files)
+                    backup_portfolio()
+                    st.session_state.portfolio = extracted_data
+                    save_json(DB_FILE, st.session_state.portfolio)
+                    st.rerun()
+                except Exception as e: st.error(f"エラー: {e}")
+        else:
+            st.warning("画像がアップロードされていません。")
 
 # --- 5. メイン画面 ---
 st.title("🚀 Strategist Dashboard")
 
-if st.session_state.events:
-    st.write("📌 **重要スケジュール**")
-    cols = st.columns(len(st.session_state.events))
-    for i, event in enumerate(st.session_state.events):
-        try:
-            target_date = datetime.strptime(event['date'], "%Y-%m-%d")
-            days_left = (target_date - datetime.now()).days
-            cols[i].markdown(f"<small>{event['name']}</small>", unsafe_allow_html=True)
-            cols[i].metric("", event['date'], f"あと {days_left} 日")
-        except: pass
-
-st.divider()
+# 【改修１】Portfolio Monitor を最上部に配置
 st.header("📉 Portfolio Monitor")
-if st.button('最新価格に更新'): st.rerun()
 
-prices_dict = get_live_prices(st.session_state.portfolio.keys())
+# 15分（900,000ミリ秒）ごとに自動で画面を再実行する
+st_autorefresh(interval=PRICE_CACHE_TTL_SECONDS * 1000, key="auto_price_refresh")
+
+def simulate_equal_investment(total_amount, input_currency, prices_dict, rate):
+    """
+    現在のポートフォリオ銘柄に、投資金額を均等配分する。
+    - 投資額はJPY基準に変換した上で銘柄数で等分する
+    - 各銘柄は自国通貨に変換し、現在株価で1株単位（切り捨て）の株数を算出する
+    戻り値: (success, {key: shares} または None, 必要最低金額(入力通貨換算) または 0)
+    """
+    keys = list(st.session_state.portfolio.keys())
+    if not keys:
+        return False, None, 0
+
+    # 現在価格を取得できた銘柄のみを対象にする
+    valid_entries = {}
+    for key in keys:
+        info = st.session_state.portfolio[key]
+        p_data = prices_dict.get(key)
+        cur = p_data.get("current") if p_data else None
+        if cur is None or pd.isna(cur):
+            continue
+        valid_entries[key] = {"price": float(cur), "currency": info.get("currency", "JPY")}
+
+    if not valid_entries:
+        return False, None, 0
+
+    n_valid = len(valid_entries)
+    total_jpy = total_amount if input_currency == "JPY" else total_amount * rate
+    equal_per_stock_jpy = total_jpy / n_valid
+
+    # 各銘柄の価格をJPY換算し、最も高い銘柄を特定（＝均等配分の上での制約条件）
+    max_price_jpy = 0
+    for e in valid_entries.values():
+        price_jpy = e["price"] * rate if e["currency"] == "USD" else e["price"]
+        max_price_jpy = max(max_price_jpy, price_jpy)
+
+    if equal_per_stock_jpy < max_price_jpy:
+        min_required_jpy = max_price_jpy * n_valid
+        min_required_display = min_required_jpy if input_currency == "JPY" else min_required_jpy / rate
+        return False, None, min_required_display
+
+    result_shares = {}
+    for key, e in valid_entries.items():
+        equal_amount_native = equal_per_stock_jpy if e["currency"] == "JPY" else equal_per_stock_jpy / rate
+        result_shares[key] = int(equal_amount_native // e["price"])  # 1株単位（切り捨て）
+
+    return True, result_shares, 0
+
+col_refresh, col_ts, col_sim = st.columns([1, 2, 2])
+if col_refresh.button('最新価格に更新'):
+    # キャッシュを明示的に破棄してから再実行（手動更新は必ず最新値を取りに行く）
+    _fetch_prices_cached.clear()
+    st.rerun()
+
+prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys(), td_api_key=current_twelvedata_key)
+col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（15分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
+
+# --- 価格取得エラーの診断表示（原因調査用） ---
+_fetch_errors = prices_dict.get("_fetch_errors", {})
+_fetch_debug = prices_dict.get("_fetch_debug", {})
+if _fetch_errors:
+    with st.expander(f"⚠️ 価格取得に失敗した銘柄があります（{len(_fetch_errors)}件）"):
+        for err_key, err_msg in _fetch_errors.items():
+            st.caption(f"**{err_key}**: {err_msg}")
+if _fetch_debug:
+    with st.expander("🔍 取得データの詳細（デバッグ用）", expanded=False):
+        st.caption("表示中の「終値」がYahoo Financeから返ってきた最新の値です。"
+                   "「最新価格に更新」を数分あけて複数回押し、ここの日時・値が動くか確認してください。")
+        for dbg_key, dbg_msg in _fetch_debug.items():
+            st.caption(f"**{dbg_key}**: {dbg_msg}")
+
+with col_sim:
+    sim_amt_col, sim_cur_col = st.columns([2, 1])
+    sim_amount = sim_amt_col.number_input(
+        "投資金額", min_value=0.0, value=0.0, step=1000.0,
+        key="sim_amount", label_visibility="collapsed", placeholder="投資金額"
+    )
+    sim_currency_label = sim_cur_col.selectbox(
+        "単位", ["円", "ドル"], key="sim_currency", label_visibility="collapsed"
+    )
+    sim_currency = "JPY" if sim_currency_label == "円" else "USD"
+
+    sim_btn_col1, sim_btn_col2 = st.columns(2)
+    virtual_order_clicked = sim_btn_col1.button("仮想注文", use_container_width=True)
+    revert_clicked = sim_btn_col2.button("戻す", use_container_width=True)
+
+    if virtual_order_clicked:
+        if not sim_amount or sim_amount <= 0:
+            st.warning("投資金額を入力してください")
+        else:
+            success, result_shares, min_needed = simulate_equal_investment(
+                sim_amount, sim_currency, prices_dict, rate
+            )
+            if success:
+                backup_portfolio()
+                for key, shares in result_shares.items():
+                    p_data = prices_dict.get(key)
+                    cur = p_data.get("current") if p_data else None
+                    st.session_state.portfolio[key]['shares'] = shares
+                    if cur is not None and not pd.isna(cur):
+                        st.session_state.portfolio[key]['cost'] = round(float(cur), 2)
+                save_json(DB_FILE, st.session_state.portfolio)
+                st.success(f"{len(result_shares)}銘柄に均等配分しました")
+                st.rerun()
+            else:
+                unit = "円" if sim_currency == "JPY" else "ドル"
+                st.error(f"投資金額が不足しています。最低 {min_needed:,.0f}{unit} 必要です。")
+
+    if revert_clicked:
+        if st.session_state.prev_portfolio is not None:
+            st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
+            st.session_state.prev_portfolio = None
+            save_json(DB_FILE, st.session_state.portfolio)
+            st.success("仮想注文前の状態に戻しました")
+            st.rerun()
+        else:
+            st.error("戻せる状態がありません")
 
 rows = []
 total_profit_jpy = 0
 total_profit_usd_only_us_stocks = 0
 
 for i, (key, info) in enumerate(st.session_state.portfolio.items()):
-    p_data = prices_dict.get(key)
-    if p_data and info.get('shares', 0) >= 0:
-        cur, prev = p_data["current"], p_data["prev_close"]
-        day_change_pct = f"({(cur - prev) / prev * 100:+.2f}%)" if prev else ""
-        display_name = f"{key.split('_')[0]} {info.get('name','')}"
-        
-        if info['shares'] == 0:
-            p_jpy = 0
-        else:
-            if "_SHORT" in key:
-                label, p_jpy = "信用(売建)", (info['cost'] - cur) * info['shares']
-            elif "_MARGIN_LONG" in key:
-                label, p_jpy = "信用(買建)", (cur - info['cost']) * info['shares']
-            else:
-                label = "現物"
-                if info.get('currency') == "USD":
-                    p_usd = (cur - info['cost']) * info['shares']
-                    p_jpy = p_usd * rate
-                    total_profit_usd_only_us_stocks += p_usd
-                else: p_jpy = (cur - info['cost']) * info['shares']
+    shares = info.get('shares', 0)
+    if shares < 0:
+        continue
 
-        total_profit_jpy += p_jpy
-        cost_display = f"${info['cost']:,}" if info.get('currency') == "USD" else f"¥{info['cost']:,}"
+    p_data = prices_dict.get(key)
+    display_name = f"{key.split('_')[0]} {info.get('name','')}"
+
+    # --- 価格取得の成否を判定（NaN・取得失敗の両方をここで吸収する） ---
+    cur, prev = None, None
+    price_available = False
+    if p_data:
+        cur, prev = p_data.get("current"), p_data.get("prev_close")
+        if cur is not None and not pd.isna(cur):
+            price_available = True
+
+    day_change_pct = ""
+    if price_available and prev is not None and not pd.isna(prev) and prev != 0:
+        day_change_pct = f"({(cur - prev) / prev * 100:+.2f}%)"
+
+    if shares == 0:
+        p_jpy = 0
+        label = "決済済"
+    elif not price_available:
+        # 価格が取得できない銘柄は損益0円として扱い、合計に影響を与えない
+        p_jpy = 0
+        label = "信用(売建)" if "_SHORT" in key else ("信用(買建)" if "_MARGIN_LONG" in key else "現物")
+    else:
+        # --- [修正版] 損益計算ロジック ---
+        if "_SHORT" in key:
+            label = "信用(売建)"
+            diff = info['cost'] - cur
+        elif "_MARGIN_LONG" in key:
+            label = "信用(買建)"
+            diff = cur - info['cost']
+        else:
+            label = "現物"
+            diff = cur - info['cost']
+
+        if info.get('currency') == "USD":
+            p_usd = diff * shares
+            p_jpy = p_usd * rate
+            total_profit_usd_only_us_stocks += p_usd
+        else:
+            p_jpy = diff * shares
+        # ---------------------------------
+
+    total_profit_jpy += p_jpy
+
+    cost_display = f"${info['cost']:,}" if info.get('currency') == "USD" else f"¥{info['cost']:,}"
+    if shares == 0:
+        cur_display = "-"
+    elif price_available:
         cur_display = f"{('$' if info.get('currency') == 'USD' else '¥')}{cur:,.2f} {day_change_pct}"
-        
-        rows.append({
-            "No.": i + 1, "銘柄": display_name, "数量": info['shares'], "区分": label if info['shares'] > 0 else "決済済",
-            "取得単価": cost_display, "現在値 (前日比)": cur_display, "損益(円)": f"¥{p_jpy:,.0f}"
-        })
+    else:
+        cur_display = "⚠️ 価格取得失敗"
+
+    display_label = label if shares > 0 else "決済済"
+    if shares > 0 and not price_available:
+        display_label += "（未反映）"
+
+    rows.append({
+        "No.": i + 1, "銘柄": display_name, "数量": shares, "区分": display_label,
+        "取得単価": cost_display, "現在値 (前日比)": cur_display,
+        "損益(円)": f"¥{p_jpy:,.0f}" if (shares == 0 or price_available) else "¥0（未反映）"
+    })
 
 m_col1, m_col2 = st.columns(2)
 m_col1.metric("総合計損益 (JPY)", f"¥{total_profit_jpy:,.0f}", delta=f"USD/JPY: {rate:.2f}")
@@ -349,6 +1204,30 @@ m_col2.metric("米国株合計損益 (USD)", f"${total_profit_usd_only_us_stocks
 
 if rows: st.table(pd.DataFrame(rows))
 else: st.info("銘柄がありません")
+
+st.divider()
+
+# 【改修２】重要スケジュールを複数行に表示して重なりを防止
+if st.session_state.events:
+    st.write("📌 **重要スケジュール**")
+    
+    # 1行あたり最大3つのイベントを表示する
+    MAX_COLS = 3
+    events = st.session_state.events
+    
+    for i in range(0, len(events), MAX_COLS):
+        # 3つずつのチャンクに分ける
+        chunk = events[i:i + MAX_COLS]
+        cols = st.columns(MAX_COLS)
+        
+        for j, event in enumerate(chunk):
+            try:
+                target_date = datetime.strptime(event['date'], "%Y-%m-%d")
+                days_left = (target_date - now_jst()).days
+                # フォントサイズの調整と重なり防止のため改行を含むマークダウンを使用
+                cols[j].markdown(f"**{event['name']}**", unsafe_allow_html=True)
+                cols[j].metric("", event['date'], f"あと {days_left} 日")
+            except: pass
 
 st.divider()
 st.subheader("📋 Reminder")
