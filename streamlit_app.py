@@ -167,6 +167,16 @@ def export_to_spreadsheet(data):
             excess = total - MAX_BACKUPS
             # 2行目（最古データ）から excess 件分をまとめて削除
             ws.delete_rows(2, 1 + excess)
+            total = get_backup_count(ws)  # 削除後の正しい件数に更新
+
+        # --- 重要：セッションが保持している先読みキャッシュ・総件数は
+        # この時点で古くなっているため、次回のナビゲーション操作が
+        # サーバーの最新状態を正しく参照できるようリセットしておく ---
+        st.session_state.backup_total = total
+        st.session_state.backup_cache = {}
+        st.session_state.cache_min = None
+        st.session_state.cache_max = None
+        st.session_state.backup_index = None
 
         display_ts = datetime.strptime(timestamp, TIMESTAMP_FMT).strftime(DISPLAY_FMT)
         st.success(f"バックアップを保存しました（{display_ts}）")
