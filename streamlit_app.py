@@ -700,18 +700,22 @@ st.markdown("""
         background-color: #ff4b4b !important;
         color: white !important;
     }
-    /* 仮想注文パネルを画面右下に固定表示する */
-    div[class*="st-key-floating_sim_panel"] {
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        width: 320px;
-        background-color: #0e1117;
-        border: 1px solid #444;
-        border-radius: 10px;
-        padding: 14px 16px;
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
-        z-index: 9999;
+    /* 仮想注文パネル：PC幅（769px以上）のときだけ画面右下に固定表示する。
+       スマホ幅では固定を解除し、通常のページの流れに沿って表示することで
+       コンテンツに重ならないようにする */
+    @media (min-width: 769px) {
+        div[class*="st-key-floating_sim_panel"] {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 320px;
+            background-color: #0e1117;
+            border: 1px solid #444;
+            border-radius: 10px;
+            padding: 14px 16px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
+            z-index: 9999;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -1105,53 +1109,54 @@ prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.key
 col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（15分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
 
-# --- 仮想注文パネル（画面右下に固定表示） ---
+# --- 仮想注文パネル（PC幅では画面右下に固定表示、スマホ幅では通常フロー） ---
 with st.container(key="floating_sim_panel"):
-    sim_amt_col, sim_cur_col = st.columns([2, 1])
-    sim_amount = sim_amt_col.number_input(
-        "投資金額", min_value=0.0, value=0.0, step=1000.0,
-        key="sim_amount", label_visibility="collapsed", placeholder="投資金額"
-    )
-    sim_currency_label = sim_cur_col.selectbox(
-        "単位", ["円", "ドル"], key="sim_currency", label_visibility="collapsed"
-    )
-    sim_currency = "JPY" if sim_currency_label == "円" else "USD"
+    with st.expander("💰 仮想注文", expanded=False):
+        sim_amt_col, sim_cur_col = st.columns([2, 1])
+        sim_amount = sim_amt_col.number_input(
+            "投資金額", min_value=0.0, value=0.0, step=1000.0,
+            key="sim_amount", label_visibility="collapsed", placeholder="投資金額"
+        )
+        sim_currency_label = sim_cur_col.selectbox(
+            "単位", ["円", "ドル"], key="sim_currency", label_visibility="collapsed"
+        )
+        sim_currency = "JPY" if sim_currency_label == "円" else "USD"
 
-    sim_btn_col1, sim_btn_col2 = st.columns(2)
-    virtual_order_clicked = sim_btn_col1.button("仮想注文", use_container_width=True)
-    revert_clicked = sim_btn_col2.button("戻す", use_container_width=True)
+        sim_btn_col1, sim_btn_col2 = st.columns(2)
+        virtual_order_clicked = sim_btn_col1.button("仮想注文", use_container_width=True)
+        revert_clicked = sim_btn_col2.button("戻す", use_container_width=True)
 
-    if virtual_order_clicked:
-        if not sim_amount or sim_amount <= 0:
-            st.warning("投資金額を入力してください")
-        else:
-            success, result_shares, min_needed = simulate_equal_investment(
-                sim_amount, sim_currency, prices_dict, rate
-            )
-            if success:
-                backup_portfolio()
-                for key, shares in result_shares.items():
-                    p_data = prices_dict.get(key)
-                    cur = p_data.get("current") if p_data else None
-                    st.session_state.portfolio[key]['shares'] = shares
-                    if cur is not None and not pd.isna(cur):
-                        st.session_state.portfolio[key]['cost'] = round(float(cur), 2)
+        if virtual_order_clicked:
+            if not sim_amount or sim_amount <= 0:
+                st.warning("投資金額を入力してください")
+            else:
+                success, result_shares, min_needed = simulate_equal_investment(
+                    sim_amount, sim_currency, prices_dict, rate
+                )
+                if success:
+                    backup_portfolio()
+                    for key, shares in result_shares.items():
+                        p_data = prices_dict.get(key)
+                        cur = p_data.get("current") if p_data else None
+                        st.session_state.portfolio[key]['shares'] = shares
+                        if cur is not None and not pd.isna(cur):
+                            st.session_state.portfolio[key]['cost'] = round(float(cur), 2)
+                    save_json(DB_FILE, st.session_state.portfolio)
+                    st.success(f"{len(result_shares)}銘柄に均等配分しました")
+                    st.rerun()
+                else:
+                    unit = "円" if sim_currency == "JPY" else "ドル"
+                    st.error(f"投資金額が不足しています。最低 {min_needed:,.0f}{unit} 必要です。")
+
+        if revert_clicked:
+            if st.session_state.prev_portfolio is not None:
+                st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
+                st.session_state.prev_portfolio = None
                 save_json(DB_FILE, st.session_state.portfolio)
-                st.success(f"{len(result_shares)}銘柄に均等配分しました")
+                st.success("仮想注文前の状態に戻しました")
                 st.rerun()
             else:
-                unit = "円" if sim_currency == "JPY" else "ドル"
-                st.error(f"投資金額が不足しています。最低 {min_needed:,.0f}{unit} 必要です。")
-
-    if revert_clicked:
-        if st.session_state.prev_portfolio is not None:
-            st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
-            st.session_state.prev_portfolio = None
-            save_json(DB_FILE, st.session_state.portfolio)
-            st.success("仮想注文前の状態に戻しました")
-            st.rerun()
-        else:
-            st.error("戻せる状態がありません")
+                st.error("戻せる状態がありません")
 
 rows = []
 total_profit_jpy = 0
