@@ -898,7 +898,7 @@ with st.sidebar:
         save_json(REMINDER_FILE, new_reminder)
         st.rerun()
 
-    st.divider()
+    st.markdown('<hr style="margin: 0.5rem 0;">', unsafe_allow_html=True)
     st.subheader("💾 Backup (Spreadsheet)")
     full_config = {"portfolio": st.session_state.portfolio, "events": st.session_state.events, "reminder_text": st.session_state.reminder_text}
     
@@ -926,7 +926,7 @@ with st.sidebar:
                 st.success(f"バックアップを上書きしました（{display_ts}）")
 
     # --- キャッシュ強制更新（他デバイスでの変更等をスプレッドシートから読み直す） ---
-    if st.button("🔄 スプレッドシートを再読み込み（キャッシュ更新）"):
+    if st.button("🔄 スプレッドシートを再読み込み"):
         st.session_state.backup_cache = {}
         st.session_state.cache_min = None
         st.session_state.cache_max = None
@@ -1156,6 +1156,7 @@ with st.container(key="floating_sim_panel"):
 rows = []
 total_profit_jpy = 0
 total_profit_usd_only_us_stocks = 0
+total_cost_basis_jpy = 0  # 含み損益率(%)算出用：価格取得できた銘柄の取得金額合計（円換算）
 
 for i, (key, info) in enumerate(st.session_state.portfolio.items()):
     shares = info.get('shares', 0)
@@ -1200,8 +1201,10 @@ for i, (key, info) in enumerate(st.session_state.portfolio.items()):
             p_usd = diff * shares
             p_jpy = p_usd * rate
             total_profit_usd_only_us_stocks += p_usd
+            total_cost_basis_jpy += info['cost'] * shares * rate
         else:
             p_jpy = diff * shares
+            total_cost_basis_jpy += info['cost'] * shares
         # ---------------------------------
 
     total_profit_jpy += p_jpy
@@ -1225,7 +1228,14 @@ for i, (key, info) in enumerate(st.session_state.portfolio.items()):
     })
 
 m_col1, m_col2 = st.columns(2)
-m_col1.metric("総合計損益 (JPY)", f"¥{total_profit_jpy:,.0f}", delta=f"USD/JPY: {rate:.2f}")
+with m_col1:
+    sub_amount, sub_pct = st.columns([2, 1])
+    sub_amount.metric("総合計損益 (JPY)", f"¥{total_profit_jpy:,.0f}", delta=f"USD/JPY: {rate:.2f}")
+    if total_cost_basis_jpy != 0:
+        total_pl_pct = total_profit_jpy / total_cost_basis_jpy * 100
+        sub_pct.metric("含み損益率", f"{total_pl_pct:+.2f}%")
+    else:
+        sub_pct.metric("含み損益率", "—")
 m_col2.metric("米国株合計損益 (USD)", f"${total_profit_usd_only_us_stocks:,.2f}")
 
 if rows: st.table(pd.DataFrame(rows))
