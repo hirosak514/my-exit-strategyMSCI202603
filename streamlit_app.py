@@ -1,7 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time
 import google.generativeai as genai
 from PIL import Image
 import json
@@ -1101,18 +1101,92 @@ st.header("📉 Portfolio Monitor")
 # 15分（900,000ミリ秒）ごとに自動で画面を再実行する
 st_autorefresh(interval=PRICE_CACHE_TTL_SECONDS * 1000, key="auto_price_refresh")
 
-def simulate_equal_investment(total_amount, input_currency, prices_dict, rate):
+def fetch_jp_mid_price(code):
+    """
+    日本株の「仲値」を取得する。ここでは「前場の終値（前引け、11:30頃の株価）」と定義する。
+    直近5営業日分の1分足を取得し、
+    1. 当日の11:30以前の足があればその最後の値を採用
+    2. 当日分がまだ無い（前場中でまだ11:30に達していない等）場合は、
+       直近の過去営業日をさかのぼり、その日の11:30以前の最後の足を採用
+       （その日に11:30以前の足が無ければ、その日の最後の足で代用）
+    取得できなければ None を返す（呼び出し側で現在値にフォールバックする）。
+    """
+    ticker = f"{code}.T" if code != "IHI" else "7013.T"
+    try:
+        hist = yf.Ticker(ticker).history(period="5d", interval="1m")
+        if hist.empty:
+            return None
+
+        idx = hist.index
+        if idx.tz is not None:
+            idx_jst = idx.tz_convert('Asia/Tokyo')
+        else:
+            idx_jst = idx.tz_localize('UTC').tz_convert('Asia/Tokyo')
+        hist = hist.copy()
+        hist.index = idx_jst
+
+        all_dates = sorted(set(hist.index.date))
+        if not all_dates:
+            return None
+        today_jst = now_jst().date()
+        now_time_jst = now_jst().time()
+
+        # 1. 当日が既に11:30を過ぎていて、かつ当日の前場データがあればそれを使う
+        #    （実際の現在時刻が11:30未満の場合、途中までのデータしか無くても
+        #    「前引け済み」と誤判定しないよう、現在時刻そのものを判定条件に含める）
+        if now_time_jst >= dt_time(11, 30) and today_jst in all_dates:
+            today_data = hist[hist.index.date == today_jst]
+            morning_today = today_data[today_data.index.time <= dt_time(11, 30)]
+            if not morning_today.empty:
+                return float(morning_today['Close'].iloc[-1])
+
+        # 2. 当日分がまだ無い場合は、直近の過去営業日をさかのぼって前引け値を探す
+        past_dates = sorted([d for d in all_dates if d != today_jst], reverse=True)
+        for d in past_dates:
+            day_data = hist[hist.index.date == d]
+            morning_day = day_data[day_data.index.time <= dt_time(11, 30)]
+            if not morning_day.empty:
+                return float(morning_day['Close'].iloc[-1])
+            if not day_data.empty:
+                # その日に11:30以前の足が無ければ、その日の最後の足で代用
+                return float(day_data['Close'].iloc[-1])
+
+        return None
+    except Exception:
+        return None
+
+def fetch_prev_close_fallback(ticker):
+    """
+    prev_close が通常経路で取得できない場合の最終手段。
+    日足を取得し、前日（＝2番目に新しい行）の終値を返す。
+    1日分しか無い場合はその1日の終値を返す。取得できなければNone。
+    """
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        if hist.empty:
+            return None
+        if len(hist) >= 2:
+            return float(hist['Close'].iloc[-2])
+        return float(hist['Close'].iloc[-1])
+    except Exception:
+        return None
+
+def simulate_equal_investment(total_amount, input_currency, prices_dict, rate, order_mode="即注文"):
     """
     現在のポートフォリオ銘柄に、投資金額を均等配分する。
     - 投資額はJPY基準に変換した上で銘柄数で等分する
-    - 各銘柄は自国通貨に変換し、現在株価で1株単位（切り捨て）の株数を算出する
-    戻り値: (success, {key: shares} または None, 必要最低金額(入力通貨換算) または 0)
+    - 各銘柄は自国通貨に変換し、約定価格で1株単位（切り捨て）の株数を算出する
+    - order_mode: "即注文"（現在値）/ "終値注文"（前日終値）/ "仲値注文"（日本株のみ、前場終値＝前引け値）
+      "終値注文"でprev_closeが取れない場合は日足から前日終値を再取得を試み、それでもダメなら現在値にフォールバック。
+      "仲値注文"で日本株以外、または仲値が取れない場合は現在値にフォールバックする
+      （仲値自体は当日分が無ければ直近の過去営業日の前引け値を自動的にさかのぼって探す）。
+    戻り値: (success, {key: {"shares":..., "exec_price":...}} または None, 必要最低金額(入力通貨換算) または 0)
     """
     keys = list(st.session_state.portfolio.keys())
     if not keys:
         return False, None, 0
 
-    # 現在価格を取得できた銘柄のみを対象にする
+    # 現在価格を取得できた銘柄のみを対象にする（約定価格の基準として現在値の生存確認に使う）
     valid_entries = {}
     for key in keys:
         info = st.session_state.portfolio[key]
@@ -1120,7 +1194,32 @@ def simulate_equal_investment(total_amount, input_currency, prices_dict, rate):
         cur = p_data.get("current") if p_data else None
         if cur is None or pd.isna(cur):
             continue
-        valid_entries[key] = {"price": float(cur), "currency": info.get("currency", "JPY")}
+
+        currency = info.get("currency", "JPY")
+        code = key.split('_')[0]
+        exec_price = float(cur)  # デフォルト＝即注文
+
+        if order_mode == "終値注文":
+            prev = p_data.get("prev_close")
+            if prev is not None and not pd.isna(prev):
+                exec_price = float(prev)
+            else:
+                ticker = f"{code}.T" if currency == "JPY" else code.upper()
+                if code == "IHI":
+                    ticker = "7013.T"
+                fallback = fetch_prev_close_fallback(ticker)
+                if fallback is not None:
+                    exec_price = fallback
+                # それでも取れない場合は現在値のままフォールバック
+        elif order_mode == "仲値注文":
+            if currency == "JPY":
+                mid = fetch_jp_mid_price(code)
+                if mid is not None:
+                    exec_price = mid
+                # 仲値が取れない場合は現在値のままフォールバック
+            # 米国株は仲値注文非対応のため現在値のままフォールバック
+
+        valid_entries[key] = {"price": exec_price, "currency": currency}
 
     if not valid_entries:
         return False, None, 0
@@ -1140,12 +1239,13 @@ def simulate_equal_investment(total_amount, input_currency, prices_dict, rate):
         min_required_display = min_required_jpy if input_currency == "JPY" else min_required_jpy / rate
         return False, None, min_required_display
 
-    result_shares = {}
+    result = {}
     for key, e in valid_entries.items():
         equal_amount_native = equal_per_stock_jpy if e["currency"] == "JPY" else equal_per_stock_jpy / rate
-        result_shares[key] = int(equal_amount_native // e["price"])  # 1株単位（切り捨て）
+        shares = int(equal_amount_native // e["price"])  # 1株単位（切り捨て）
+        result[key] = {"shares": shares, "exec_price": e["price"]}
 
-    return True, result_shares, 0
+    return True, result, 0
 
 col_refresh, col_ts, col_delete = st.columns([1, 2, 1])
 if col_refresh.button('最新価格に更新'):
@@ -1201,6 +1301,13 @@ with st.container(key="floating_sim_panel"):
         )
         sim_currency = "JPY" if sim_currency_label == "円" else "USD"
 
+        sim_order_mode = st.radio(
+            "注文方法", ["即注文", "仲値注文", "終値注文"], index=0,
+            key="sim_order_mode", horizontal=True
+        )
+        if sim_order_mode == "仲値注文":
+            st.caption("※ 仲値注文は日本株のみ対応です（米国株は現在値で約定します）")
+
         sim_btn_col1, sim_btn_col2 = st.columns(2)
         virtual_order_clicked = sim_btn_col1.button("仮想注文", use_container_width=True)
         revert_clicked = sim_btn_col2.button("戻す", use_container_width=True)
@@ -1209,19 +1316,16 @@ with st.container(key="floating_sim_panel"):
             if not sim_amount or sim_amount <= 0:
                 st.warning("投資金額を入力してください")
             else:
-                success, result_shares, min_needed = simulate_equal_investment(
-                    sim_amount, sim_currency, prices_dict, rate
+                success, result, min_needed = simulate_equal_investment(
+                    sim_amount, sim_currency, prices_dict, rate, order_mode=sim_order_mode
                 )
                 if success:
                     backup_portfolio()
-                    for key, shares in result_shares.items():
-                        p_data = prices_dict.get(key)
-                        cur = p_data.get("current") if p_data else None
-                        st.session_state.portfolio[key]['shares'] = shares
-                        if cur is not None and not pd.isna(cur):
-                            st.session_state.portfolio[key]['cost'] = round(float(cur), 2)
+                    for key, r in result.items():
+                        st.session_state.portfolio[key]['shares'] = r['shares']
+                        st.session_state.portfolio[key]['cost'] = round(r['exec_price'], 2)
                     save_json(DB_FILE, st.session_state.portfolio)
-                    st.success(f"{len(result_shares)}銘柄に均等配分しました")
+                    st.success(f"{len(result)}銘柄に均等配分しました（{sim_order_mode}）")
                     st.rerun()
                 else:
                     unit = "円" if sim_currency == "JPY" else "ドル"
