@@ -1327,15 +1327,29 @@ with st.container(key="floating_sim_panel"):
         if sim_order_mode == "仲値注文":
             st.caption("※ 仲値注文は日本株のみ対応です（米国株は現在値で約定します）")
 
+        def business_days_back(base_date, n):
+            """base_dateからn営業日（土日を除く。日本の祝日は考慮しない簡易版）だけさかのぼった日付を返す"""
+            d = base_date
+            count = 0
+            while count < n:
+                d -= timedelta(days=1)
+                if d.weekday() < 5:  # 0=月曜〜4=金曜
+                    count += 1
+            return d
+
+        sim_min_date = business_days_back(now_jst().date(), 7)
         sim_reference_date = st.date_input(
             "基準日",
             value=now_jst().date(),
-            min_value=now_jst().date() - timedelta(days=7),
+            min_value=sim_min_date,
             max_value=now_jst().date(),
             key="sim_reference_date",
             disabled=(sim_order_mode == "即注文"),
-            help="始値注文・仲値注文・終値注文の基準となる日付（最大7日前まで）。即注文では使用しません。"
+            help="始値注文・仲値注文・終値注文の基準となる日付（直近7営業日まで）。即注文では使用しません。"
         )
+        if sim_order_mode == "仲値注文" and sim_reference_date < now_jst().date() - timedelta(days=7):
+            st.caption("⚠️ 仲値注文は暦日ベースで直近7日分のデータしか取得できないため、"
+                       "この基準日では取得できず現在値にフォールバックする可能性があります。")
 
         sim_btn_col1, sim_btn_col2 = st.columns(2)
         virtual_order_clicked = sim_btn_col1.button("仮想注文", use_container_width=True)
