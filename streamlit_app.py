@@ -1101,19 +1101,64 @@ st.header("📉 Portfolio Monitor")
 # 15分（900,000ミリ秒）ごとに自動で画面を再実行する
 st_autorefresh(interval=PRICE_CACHE_TTL_SECONDS * 1000, key="auto_price_refresh")
 
-def fetch_jp_mid_price(code):
+def fetch_open_price_for_date(code, currency, reference_date):
     """
-    日本株の「仲値」を取得する。ここでは「前場の終値（前引け、11:30頃の株価）」と定義する。
-    直近5営業日分の1分足を取得し、
-    1. 当日の11:30以前の足があればその最後の値を採用
-    2. 当日分がまだ無い（前場中でまだ11:30に達していない等）場合は、
-       直近の過去営業日をさかのぼり、その日の11:30以前の最後の足を採用
-       （その日に11:30以前の足が無ければ、その日の最後の足で代用）
-    取得できなければ None を返す（呼び出し側で現在値にフォールバックする）。
+    基準日(reference_date)を基準に始値を取得する。
+    基準日の日足があればその始値、無ければ基準日以前で直近の日足の始値を使う
+    （基準日が休日や、基準日=当日でまだ開場前の場合等に自動的に直近の値へフォールバックする）。
+    取得できなければNoneを返す。
+    """
+    ticker = f"{code}.T" if (currency == "JPY" and code != "IHI") else ("7013.T" if code == "IHI" else code.upper())
+    try:
+        hist = yf.Ticker(ticker).history(period="1mo")  # 基準日が7日前でも余裕を持って1ヶ月分取得
+        if hist.empty:
+            return None
+        hist = hist.copy()
+        hist['_date'] = hist.index.date
+        candidates = hist[hist['_date'] <= reference_date]
+        if candidates.empty:
+            return None
+        return float(candidates['Open'].iloc[-1])
+    except Exception:
+        return None
+
+def fetch_close_price_for_date(code, currency, reference_date):
+    """
+    基準日を基準に終値を取得する。
+    ・基準日が「今日」の場合：今日の終値はまだ確定していないとみなし、前営業日以前の直近の確定終値を使う
+    ・基準日が過去日の場合：その日（無ければ基準日以前で直近の過去営業日）の終値を使う
+    取得できなければNoneを返す。
+    """
+    ticker = f"{code}.T" if (currency == "JPY" and code != "IHI") else ("7013.T" if code == "IHI" else code.upper())
+    today_jst = now_jst().date()
+    try:
+        hist = yf.Ticker(ticker).history(period="1mo")
+        if hist.empty:
+            return None
+        hist = hist.copy()
+        hist['_date'] = hist.index.date
+        if reference_date >= today_jst:
+            candidates = hist[hist['_date'] < today_jst]  # 当日はまだ未確定なので除外
+        else:
+            candidates = hist[hist['_date'] <= reference_date]
+        if candidates.empty:
+            return None
+        return float(candidates['Close'].iloc[-1])
+    except Exception:
+        return None
+
+def fetch_mid_price_for_date(code, reference_date):
+    """
+    基準日を基準に日本株の「仲値」（前場の終値＝前引け、11:30頃の株価）を取得する。
+    Yahoo Financeの1分足は直近7日分しか取得できないため、基準日は7日前までに限定される前提。
+    ・基準日が「今日」かつ実際の現在時刻がまだ11:30前の場合：今日はスキップし、直近の過去営業日を使う
+    ・それ以外：基準日（無ければ基準日以前で直近の過去営業日）の11:30以前の最後の足を採用
+      （その日に11:30以前の足が無ければ、その日の最後の足で代用）
+    取得できなければNoneを返す。
     """
     ticker = f"{code}.T" if code != "IHI" else "7013.T"
     try:
-        hist = yf.Ticker(ticker).history(period="5d", interval="1m")
+        hist = yf.Ticker(ticker).history(period="7d", interval="1m")
         if hist.empty:
             return None
 
@@ -1125,90 +1170,42 @@ def fetch_jp_mid_price(code):
         hist = hist.copy()
         hist.index = idx_jst
 
-        all_dates = sorted(set(hist.index.date))
-        if not all_dates:
-            return None
         today_jst = now_jst().date()
         now_time_jst = now_jst().time()
+        all_dates = sorted(set(hist.index.date))
+        candidate_dates = sorted([d for d in all_dates if d <= reference_date], reverse=True)
 
-        # 1. 当日が既に11:30を過ぎていて、かつ当日の前場データがあればそれを使う
-        #    （実際の現在時刻が11:30未満の場合、途中までのデータしか無くても
-        #    「前引け済み」と誤判定しないよう、現在時刻そのものを判定条件に含める）
-        if now_time_jst >= dt_time(11, 30) and today_jst in all_dates:
-            today_data = hist[hist.index.date == today_jst]
-            morning_today = today_data[today_data.index.time <= dt_time(11, 30)]
-            if not morning_today.empty:
-                return float(morning_today['Close'].iloc[-1])
-
-        # 2. 当日分がまだ無い場合は、直近の過去営業日をさかのぼって前引け値を探す
-        past_dates = sorted([d for d in all_dates if d != today_jst], reverse=True)
-        for d in past_dates:
+        for d in candidate_dates:
+            if d == today_jst and now_time_jst < dt_time(11, 30):
+                continue  # 当日はまだ前引け前 → この日はスキップして前の営業日へ
             day_data = hist[hist.index.date == d]
             morning_day = day_data[day_data.index.time <= dt_time(11, 30)]
             if not morning_day.empty:
                 return float(morning_day['Close'].iloc[-1])
             if not day_data.empty:
-                # その日に11:30以前の足が無ければ、その日の最後の足で代用
                 return float(day_data['Close'].iloc[-1])
 
         return None
     except Exception:
         return None
 
-def fetch_prev_close_fallback(ticker):
-    """
-    prev_close が通常経路で取得できない場合の最終手段。
-    日足を取得し、前日（＝2番目に新しい行）の終値を返す。
-    1日分しか無い場合はその1日の終値を返す。取得できなければNone。
-    """
-    try:
-        hist = yf.Ticker(ticker).history(period="5d")
-        if hist.empty:
-            return None
-        if len(hist) >= 2:
-            return float(hist['Close'].iloc[-2])
-        return float(hist['Close'].iloc[-1])
-    except Exception:
-        return None
-
-def fetch_open_price(code, currency):
-    """
-    直近の始値を取得する。
-    ・開場時間以降（当日分の日足がすでに存在する）なら、日足の最終行＝当日分のOpenがそのまま当日の始値になる
-    ・開場時間前（当日分の日足がまだ存在しない）なら、日足の最終行は自動的に前日分のままなので、
-      そのOpenがそのまま「前日の始値」になる
-    → どちらのケースも「日足の最終行のOpen」を使うだけで、開場前後の両方の仕様を満たせる。
-    日本株・米国株どちらも対応。取得できなければNoneを返す。
-    """
-    if code == "IHI":
-        ticker = "7013.T"
-    elif currency == "JPY":
-        ticker = f"{code}.T"
-    else:
-        ticker = code.upper()
-    try:
-        hist = yf.Ticker(ticker).history(period="5d")
-        if hist.empty:
-            return None
-        return float(hist['Open'].iloc[-1])
-    except Exception:
-        return None
-
-def simulate_equal_investment(total_amount, input_currency, prices_dict, rate, order_mode="即注文"):
+def simulate_equal_investment(total_amount, input_currency, prices_dict, rate, order_mode="即注文", reference_date=None):
     """
     現在のポートフォリオ銘柄に、投資金額を均等配分する。
     - 投資額はJPY基準に変換した上で銘柄数で等分する
     - 各銘柄は自国通貨に変換し、約定価格で1株単位（切り捨て）の株数を算出する
-    - order_mode: "即注文"（現在値）/ "始値注文"（直近の始値）/ "仲値注文"（日本株のみ、前場終値＝前引け値）/ "終値注文"（前日終値）
-      "始値注文"は日米どちらの銘柄にも対応（開場前は前日の始値に自動フォールバック）。
-      "終値注文"でprev_closeが取れない場合は日足から前日終値を再取得を試み、それでもダメなら現在値にフォールバック。
-      "仲値注文"で日本株以外、または仲値が取れない場合は現在値にフォールバックする
-      （仲値自体は当日分が無ければ直近の過去営業日の前引け値を自動的にさかのぼって探す）。
+    - order_mode: "即注文"（現在値、reference_dateは無視）/ "始値注文"（基準日の始値）/
+      "仲値注文"（日本株のみ、基準日の前場終値＝前引け値）/ "終値注文"（基準日の終値）
+      いずれも、基準日にデータが無い場合は基準日以前で直近の過去営業日に自動フォールバックする。
+      "仲値注文"で米国株の場合は現在値にフォールバックする。
     戻り値: (success, {key: {"shares":..., "exec_price":...}} または None, 必要最低金額(入力通貨換算) または 0)
     """
     keys = list(st.session_state.portfolio.keys())
     if not keys:
         return False, None, 0
+
+    if reference_date is None:
+        reference_date = now_jst().date()
 
     # 現在価格を取得できた銘柄のみを対象にする（約定価格の基準として現在値の生存確認に使う）
     valid_entries = {}
@@ -1224,25 +1221,18 @@ def simulate_equal_investment(total_amount, input_currency, prices_dict, rate, o
         exec_price = float(cur)  # デフォルト＝即注文
 
         if order_mode == "始値注文":
-            open_price = fetch_open_price(code, currency)
+            open_price = fetch_open_price_for_date(code, currency, reference_date)
             if open_price is not None and not pd.isna(open_price):
                 exec_price = open_price
             # 取得できない場合は現在値のままフォールバック
         elif order_mode == "終値注文":
-            prev = p_data.get("prev_close")
-            if prev is not None and not pd.isna(prev):
-                exec_price = float(prev)
-            else:
-                ticker = f"{code}.T" if currency == "JPY" else code.upper()
-                if code == "IHI":
-                    ticker = "7013.T"
-                fallback = fetch_prev_close_fallback(ticker)
-                if fallback is not None:
-                    exec_price = fallback
-                # それでも取れない場合は現在値のままフォールバック
+            close_price = fetch_close_price_for_date(code, currency, reference_date)
+            if close_price is not None and not pd.isna(close_price):
+                exec_price = close_price
+            # 取得できない場合は現在値のままフォールバック
         elif order_mode == "仲値注文":
             if currency == "JPY":
-                mid = fetch_jp_mid_price(code)
+                mid = fetch_mid_price_for_date(code, reference_date)
                 if mid is not None:
                     exec_price = mid
                 # 仲値が取れない場合は現在値のままフォールバック
@@ -1337,6 +1327,16 @@ with st.container(key="floating_sim_panel"):
         if sim_order_mode == "仲値注文":
             st.caption("※ 仲値注文は日本株のみ対応です（米国株は現在値で約定します）")
 
+        sim_reference_date = st.date_input(
+            "基準日",
+            value=now_jst().date(),
+            min_value=now_jst().date() - timedelta(days=7),
+            max_value=now_jst().date(),
+            key="sim_reference_date",
+            disabled=(sim_order_mode == "即注文"),
+            help="始値注文・仲値注文・終値注文の基準となる日付（最大7日前まで）。即注文では使用しません。"
+        )
+
         sim_btn_col1, sim_btn_col2 = st.columns(2)
         virtual_order_clicked = sim_btn_col1.button("仮想注文", use_container_width=True)
         revert_clicked = sim_btn_col2.button("戻す", use_container_width=True)
@@ -1346,7 +1346,8 @@ with st.container(key="floating_sim_panel"):
                 st.warning("投資金額を入力してください")
             else:
                 success, result, min_needed = simulate_equal_investment(
-                    sim_amount, sim_currency, prices_dict, rate, order_mode=sim_order_mode
+                    sim_amount, sim_currency, prices_dict, rate,
+                    order_mode=sim_order_mode, reference_date=sim_reference_date
                 )
                 if success:
                     backup_portfolio()
@@ -1354,7 +1355,8 @@ with st.container(key="floating_sim_panel"):
                         st.session_state.portfolio[key]['shares'] = r['shares']
                         st.session_state.portfolio[key]['cost'] = round(r['exec_price'], 2)
                     save_json(DB_FILE, st.session_state.portfolio)
-                    st.success(f"{len(result)}銘柄に均等配分しました（{sim_order_mode}）")
+                    ref_disp = sim_reference_date.strftime('%Y年%m月%d日') if sim_order_mode != "即注文" else ""
+                    st.success(f"{len(result)}銘柄に均等配分しました（{sim_order_mode}{' ' + ref_disp if ref_disp else ''}）")
                     st.rerun()
                 else:
                     unit = "円" if sim_currency == "JPY" else "ドル"
