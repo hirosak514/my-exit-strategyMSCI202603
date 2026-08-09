@@ -1171,12 +1171,36 @@ def fetch_prev_close_fallback(ticker):
     except Exception:
         return None
 
+def fetch_open_price(code, currency):
+    """
+    直近の始値を取得する。
+    ・開場時間以降（当日分の日足がすでに存在する）なら、日足の最終行＝当日分のOpenがそのまま当日の始値になる
+    ・開場時間前（当日分の日足がまだ存在しない）なら、日足の最終行は自動的に前日分のままなので、
+      そのOpenがそのまま「前日の始値」になる
+    → どちらのケースも「日足の最終行のOpen」を使うだけで、開場前後の両方の仕様を満たせる。
+    日本株・米国株どちらも対応。取得できなければNoneを返す。
+    """
+    if code == "IHI":
+        ticker = "7013.T"
+    elif currency == "JPY":
+        ticker = f"{code}.T"
+    else:
+        ticker = code.upper()
+    try:
+        hist = yf.Ticker(ticker).history(period="5d")
+        if hist.empty:
+            return None
+        return float(hist['Open'].iloc[-1])
+    except Exception:
+        return None
+
 def simulate_equal_investment(total_amount, input_currency, prices_dict, rate, order_mode="即注文"):
     """
     現在のポートフォリオ銘柄に、投資金額を均等配分する。
     - 投資額はJPY基準に変換した上で銘柄数で等分する
     - 各銘柄は自国通貨に変換し、約定価格で1株単位（切り捨て）の株数を算出する
-    - order_mode: "即注文"（現在値）/ "終値注文"（前日終値）/ "仲値注文"（日本株のみ、前場終値＝前引け値）
+    - order_mode: "即注文"（現在値）/ "始値注文"（直近の始値）/ "仲値注文"（日本株のみ、前場終値＝前引け値）/ "終値注文"（前日終値）
+      "始値注文"は日米どちらの銘柄にも対応（開場前は前日の始値に自動フォールバック）。
       "終値注文"でprev_closeが取れない場合は日足から前日終値を再取得を試み、それでもダメなら現在値にフォールバック。
       "仲値注文"で日本株以外、または仲値が取れない場合は現在値にフォールバックする
       （仲値自体は当日分が無ければ直近の過去営業日の前引け値を自動的にさかのぼって探す）。
@@ -1199,7 +1223,12 @@ def simulate_equal_investment(total_amount, input_currency, prices_dict, rate, o
         code = key.split('_')[0]
         exec_price = float(cur)  # デフォルト＝即注文
 
-        if order_mode == "終値注文":
+        if order_mode == "始値注文":
+            open_price = fetch_open_price(code, currency)
+            if open_price is not None and not pd.isna(open_price):
+                exec_price = open_price
+            # 取得できない場合は現在値のままフォールバック
+        elif order_mode == "終値注文":
             prev = p_data.get("prev_close")
             if prev is not None and not pd.isna(prev):
                 exec_price = float(prev)
@@ -1302,7 +1331,7 @@ with st.container(key="floating_sim_panel"):
         sim_currency = "JPY" if sim_currency_label == "円" else "USD"
 
         sim_order_mode = st.radio(
-            "注文方法", ["即注文", "仲値注文", "終値注文"], index=0,
+            "注文方法", ["即注文", "始値注文", "仲値注文", "終値注文"], index=0,
             key="sim_order_mode", horizontal=True
         )
         if sim_order_mode == "仲値注文":
