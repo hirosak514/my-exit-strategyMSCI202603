@@ -1387,6 +1387,7 @@ with st.container(key="floating_sim_panel"):
                 st.error("戻せる状態がありません")
 
 rows = []
+row_keys = []  # rows[i] に対応する実際の portfolio キー（削除対象の特定に使う）
 total_profit_jpy = 0
 total_profit_usd_only_us_stocks = 0
 total_cost_basis_jpy = 0  # 含み損益率(%)算出用：価格取得できた銘柄の取得金額合計（円換算）
@@ -1454,7 +1455,9 @@ for i, (key, info) in enumerate(st.session_state.portfolio.items()):
     if shares > 0 and not price_available:
         display_label += "（未反映）"
 
+    row_keys.append(key)
     rows.append({
+        "選択": False,
         "No.": i + 1, "銘柄": display_name, "数量": shares, "区分": display_label,
         "取得単価": cost_display, "現在値 (前日比)": cur_display,
         "損益(円)": f"¥{p_jpy:,.0f}" if (shares == 0 or price_available) else "¥0（未反映）"
@@ -1471,8 +1474,45 @@ with m_col1:
         sub_pct.metric("含み損益率", "—")
 m_col2.metric("米国株合計損益 (USD)", f"${total_profit_usd_only_us_stocks:,.2f}")
 
-if rows: st.table(pd.DataFrame(rows))
-else: st.info("銘柄がありません")
+if rows:
+    df_display = pd.DataFrame(rows)
+    edited_df = st.data_editor(
+        df_display,
+        column_config={
+            "選択": st.column_config.CheckboxColumn("選択", default=False, width="small"),
+        },
+        disabled=["No.", "銘柄", "数量", "区分", "取得単価", "現在値 (前日比)", "損益(円)"],
+        hide_index=True,
+        use_container_width=True,
+        key="portfolio_table_editor"
+    )
+    selected_keys = [row_keys[idx] for idx, checked in enumerate(edited_df["選択"]) if checked]
+
+    @st.dialog("確認")
+    def confirm_delete_stocks_dialog(keys_to_delete):
+        st.write(f"以下の{len(keys_to_delete)}銘柄を削除しますか？")
+        for k in keys_to_delete:
+            nm = st.session_state.portfolio.get(k, {}).get("name", "")
+            st.write(f"- {k.split('_')[0]} {nm}")
+        st.caption("削除後も「復元」ボタンで直前の状態に戻せます。")
+        col_ok, col_cancel = st.columns(2)
+        if col_ok.button("OK", use_container_width=True):
+            backup_portfolio()
+            for k in keys_to_delete:
+                st.session_state.portfolio.pop(k, None)
+            save_json(DB_FILE, st.session_state.portfolio)
+            st.session_state["_delete_stocks_success_msg"] = f"{len(keys_to_delete)}銘柄を削除しました"
+            st.rerun()
+        if col_cancel.button("Cancel", use_container_width=True):
+            st.rerun()
+
+    if st.button("🗑️ 銘柄削除", disabled=(len(selected_keys) == 0)):
+        confirm_delete_stocks_dialog(selected_keys)
+
+    if "_delete_stocks_success_msg" in st.session_state:
+        st.success(st.session_state.pop("_delete_stocks_success_msg"))
+else:
+    st.info("銘柄がありません")
 
 st.divider()
 
