@@ -400,19 +400,43 @@ def search_and_add_stock(query, add_type_label, shares, cost):
 
     return None
 
+def _read_csv_text(uploaded_file):
+    """アップロードされたCSVファイルをUTF-8-SIG/Shift_JIS両対応でテキストとして読み込む"""
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    try:
+        return raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return raw.decode('shift_jis', errors='ignore')
+
+def detect_csv_type(text):
+    """
+    コメント行（先頭'#'）を除いた最初のヘッダー行を見て、CSVの種類を判定する。
+    'holdings': 保有株数・取得単価を含む保有明細形式
+    'trend'   : code,name のみのトレンド銘柄リスト形式
+    'unknown' : 判定できない形式
+    """
+    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith('#')]
+    if not lines:
+        return 'unknown'
+    header = lines[0]
+    if ('保有株数' in header or '数量' in header) and '取得単価' in header:
+        return 'holdings'
+    header_lower = header.lower()
+    if 'code' in header_lower and 'name' in header_lower:
+        return 'trend'
+    return 'unknown'
+
 def parse_stock_csv(uploaded_file):
     """
     1行目が '#' で始まるコメント行（例: # トレンド銘柄...,保存日時:...,市場:jp）の場合はスキップし、
     'code,name' ヘッダーを持つCSVから銘柄コード・銘柄名のリストを抽出する。
     戻り値: [(code, name), ...]
     """
-    uploaded_file.seek(0)
-    raw = uploaded_file.read()
-    try:
-        text = raw.decode('utf-8-sig')
-    except UnicodeDecodeError:
-        text = raw.decode('shift_jis', errors='ignore')
+    text = _read_csv_text(uploaded_file)
+    return parse_stock_csv_text(text)
 
+def parse_stock_csv_text(text):
     lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith('#')]
     if not lines:
         return []
@@ -430,6 +454,73 @@ def parse_stock_csv(uploaded_file):
         if code:
             results.append((code, name))
     return results
+
+def parse_holdings_csv_text(text):
+    """
+    '銘柄コード,銘柄名,保有株数,取得単価（加重平均）,現在値,評価額,評価損益' のような
+    保有明細形式のCSVから、銘柄コード・銘柄名・保有株数・取得単価を抽出する。
+    列名の表記ゆれ（「数量」等）にもある程度対応する。
+    戻り値: [(code, name, shares, cost), ...]
+    """
+    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith('#')]
+    if not lines:
+        return []
+
+    reader = csv.DictReader(lines)
+    fieldnames = reader.fieldnames or []
+
+    def find_field(*keywords):
+        # キーワードを優先度順（＝より具体的なものを先）に、全列に対して試す。
+        # フィールド優先で回すと、緩いキーワードが別項目の列に誤マッチすることがあるため注意。
+        for kw in keywords:
+            for fn in fieldnames:
+                name = (fn or '').strip()
+                if kw in name:
+                    return fn
+        return None
+
+    code_field = find_field('銘柄コード', 'コード', 'code')
+    name_field = find_field('銘柄名', '名称', 'name')
+    shares_field = find_field('保有株数', '数量', 'shares')
+    cost_field = find_field('取得単価', 'cost')
+
+    results = []
+    for row in reader:
+        code = (row.get(code_field) or '').strip() if code_field else ''
+        if not code:
+            continue
+        name = (row.get(name_field) or '').strip() if name_field else ''
+        shares_raw = (row.get(shares_field) or '').strip() if shares_field else ''
+        cost_raw = (row.get(cost_field) or '').strip() if cost_field else ''
+        try:
+            shares = float(shares_raw.replace(',', '')) if shares_raw else 0.0
+        except ValueError:
+            shares = 0.0
+        try:
+            cost = float(cost_raw.replace(',', '')) if cost_raw else 0.0
+        except ValueError:
+            cost = 0.0
+        results.append((code, name, shares, cost))
+    return results
+
+def build_entries_from_holdings_csv(rows):
+    """
+    [(code, name, shares, cost), ...] から portfolio 用のエントリ辞書を作る。
+    株数・取得単価はCSVの値をそのまま使うため、価格取得のAPI呼び出しは発生しない。
+    区分は「現物」固定。
+    """
+    entries = {}
+    for code, name, shares, cost in rows:
+        is_japan = code.isdigit() and len(code) == 4
+        currency = "JPY" if is_japan else "USD"
+        key = f"{code}_現物"
+        entries[key] = {
+            "name": name or code,
+            "shares": shares,
+            "cost": round(cost, 2),
+            "currency": currency
+        }
+    return entries
 
 def build_entries_from_csv(rows, default_shares=100):
     """
@@ -1055,23 +1146,47 @@ with st.sidebar:
     )
     if st.button("csv読み込み"):
         if csv_file:
-            with st.spinner("CSVを解析し、現在株価を取得中..."):
-                try:
-                    rows = parse_stock_csv(csv_file)
-                    if not rows:
-                        st.warning("CSVから銘柄を読み取れませんでした。フォーマットをご確認ください。")
-                    else:
-                        new_entries = build_entries_from_csv(rows, default_shares=100)
-                        backup_portfolio()
-                        if csv_mode == "現在の画面に追加":
-                            st.session_state.portfolio.update(new_entries)
+            try:
+                text = _read_csv_text(csv_file)
+                csv_type = detect_csv_type(text)
+
+                if csv_type == 'holdings':
+                    with st.spinner("CSVを解析中（保有株数・取得単価をファイルから反映）..."):
+                        rows = parse_holdings_csv_text(text)
+                        if not rows:
+                            st.warning("CSVから銘柄を読み取れませんでした。フォーマットをご確認ください。")
                         else:
-                            st.session_state.portfolio = new_entries
-                        save_json(DB_FILE, st.session_state.portfolio)
-                        st.success(f"{len(new_entries)}件の銘柄を読み込みました")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"CSV読み込みエラー: {e}")
+                            new_entries = build_entries_from_holdings_csv(rows)
+                            backup_portfolio()
+                            if csv_mode == "現在の画面に追加":
+                                st.session_state.portfolio.update(new_entries)
+                            else:
+                                st.session_state.portfolio = new_entries
+                            save_json(DB_FILE, st.session_state.portfolio)
+                            st.success(f"{len(new_entries)}件の銘柄を読み込みました（保有株数・取得単価をファイルから反映）")
+                            st.rerun()
+
+                elif csv_type == 'trend':
+                    with st.spinner("CSVを解析し、現在株価を取得中..."):
+                        rows = parse_stock_csv_text(text)
+                        if not rows:
+                            st.warning("CSVから銘柄を読み取れませんでした。フォーマットをご確認ください。")
+                        else:
+                            new_entries = build_entries_from_csv(rows, default_shares=100)
+                            backup_portfolio()
+                            if csv_mode == "現在の画面に追加":
+                                st.session_state.portfolio.update(new_entries)
+                            else:
+                                st.session_state.portfolio = new_entries
+                            save_json(DB_FILE, st.session_state.portfolio)
+                            st.success(f"{len(new_entries)}件の銘柄を読み込みました（数量100・現在株価で登録）")
+                            st.rerun()
+
+                else:
+                    st.warning("CSVの形式を判定できませんでした。「code,name」形式、"
+                               "または「銘柄コード,銘柄名,保有株数,取得単価...」形式に対応しています。")
+            except Exception as e:
+                st.error(f"CSV読み込みエラー: {e}")
         else:
             st.warning("CSVファイルがアップロードされていません。")
 
