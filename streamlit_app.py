@@ -1381,7 +1381,7 @@ def simulate_equal_investment(total_amount, input_currency, prices_dict, rate, o
 
     return True, result, 0
 
-col_refresh, col_ts, col_delete = st.columns([1, 2, 1])
+col_refresh, col_ts = st.columns([1, 3])
 if col_refresh.button('最新価格に更新'):
     # キャッシュを明示的に破棄してから再実行（手動更新は必ず最新値を取りに行く）
     _fetch_prices_cached.clear()
@@ -1391,115 +1391,8 @@ prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.key
 col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（15分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
 
-@st.dialog("確認")
-def confirm_delete_sheet_dialog(target_idx):
-    st.write("現在表示中のバックアップと、対応するスプレッドシートのデータを削除しますか？")
-    st.caption("この操作は元に戻せません。")
-    col_ok, col_cancel = st.columns(2)
-    if col_ok.button("OK", use_container_width=True):
-        deleted = delete_backup_at_index(target_idx)
-        if deleted:
-            # ローカルの表示状態・キャッシュを破棄し、live編集用のportfolioに戻す
-            st.session_state.portfolio = load_json(DB_FILE, {})
-            st.session_state.events = load_json(EVENT_FILE, [])
-            st.session_state.reminder_text = load_json(REMINDER_FILE, "- ターゲット日程を入力してください")
-            st.session_state.backup_cache = {}
-            st.session_state.cache_min = None
-            st.session_state.cache_max = None
-            st.session_state.backup_total = None
-            st.session_state.backup_index = None
-            st.session_state["_delete_success_msg"] = "削除しました。データを再読み込みしました。"
-        st.rerun()
-    if col_cancel.button("Cancel", use_container_width=True):
-        st.rerun()
-
-if col_delete.button("🗑️ シート削除", use_container_width=True):
-    if st.session_state.backup_index is None:
-        st.warning("削除対象が選択されていません。先に「◀ 1つ前の設定」で対象のバックアップを表示してください。")
-    else:
-        confirm_delete_sheet_dialog(st.session_state.backup_index)
-
 if "_delete_success_msg" in st.session_state:
     st.success(st.session_state.pop("_delete_success_msg"))
-
-# --- 仮想注文パネル（PC幅では画面右下に固定表示、スマホ幅では通常フロー） ---
-with st.container(key="floating_sim_panel"):
-    with st.expander("💰 仮想注文", expanded=False):
-        sim_amt_col, sim_cur_col = st.columns([2, 1])
-        sim_amount = sim_amt_col.number_input(
-            "投資金額", min_value=0.0, value=0.0, step=1000.0,
-            key="sim_amount", label_visibility="collapsed", placeholder="投資金額"
-        )
-        sim_currency_label = sim_cur_col.selectbox(
-            "単位", ["円", "ドル"], key="sim_currency", label_visibility="collapsed"
-        )
-        sim_currency = "JPY" if sim_currency_label == "円" else "USD"
-
-        sim_order_mode = st.radio(
-            "注文方法", ["即注文", "始値注文", "仲値注文", "終値注文"], index=0,
-            key="sim_order_mode", horizontal=True
-        )
-        if sim_order_mode == "仲値注文":
-            st.caption("※ 仲値注文は日本株のみ対応です（米国株は現在値で約定します）")
-
-        def business_days_back(base_date, n):
-            """base_dateからn営業日（土日を除く。日本の祝日は考慮しない簡易版）だけさかのぼった日付を返す"""
-            d = base_date
-            count = 0
-            while count < n:
-                d -= timedelta(days=1)
-                if d.weekday() < 5:  # 0=月曜〜4=金曜
-                    count += 1
-            return d
-
-        sim_min_date = business_days_back(now_jst().date(), 7)
-        sim_reference_date = st.date_input(
-            "基準日",
-            value=now_jst().date(),
-            min_value=sim_min_date,
-            max_value=now_jst().date(),
-            key="sim_reference_date",
-            disabled=(sim_order_mode == "即注文"),
-            help="始値注文・仲値注文・終値注文の基準となる日付（直近7営業日まで）。即注文では使用しません。"
-        )
-        if sim_order_mode == "仲値注文" and sim_reference_date < now_jst().date() - timedelta(days=7):
-            st.caption("⚠️ 仲値注文は暦日ベースで直近7日分のデータしか取得できないため、"
-                       "この基準日では取得できず現在値にフォールバックする可能性があります。")
-
-        sim_btn_col1, sim_btn_col2 = st.columns(2)
-        virtual_order_clicked = sim_btn_col1.button("仮想注文", use_container_width=True)
-        revert_clicked = sim_btn_col2.button("戻す", use_container_width=True)
-
-        if virtual_order_clicked:
-            if not sim_amount or sim_amount <= 0:
-                st.warning("投資金額を入力してください")
-            else:
-                success, result, min_needed = simulate_equal_investment(
-                    sim_amount, sim_currency, prices_dict, rate,
-                    order_mode=sim_order_mode, reference_date=sim_reference_date
-                )
-                if success:
-                    backup_portfolio()
-                    for key, r in result.items():
-                        st.session_state.portfolio[key]['shares'] = r['shares']
-                        st.session_state.portfolio[key]['cost'] = round(r['exec_price'], 2)
-                    save_json(DB_FILE, st.session_state.portfolio)
-                    ref_disp = sim_reference_date.strftime('%Y年%m月%d日') if sim_order_mode != "即注文" else ""
-                    st.success(f"{len(result)}銘柄に均等配分しました（{sim_order_mode}{' ' + ref_disp if ref_disp else ''}）")
-                    st.rerun()
-                else:
-                    unit = "円" if sim_currency == "JPY" else "ドル"
-                    st.error(f"投資金額が不足しています。最低 {min_needed:,.0f}{unit} 必要です。")
-
-        if revert_clicked:
-            if st.session_state.prev_portfolio is not None:
-                st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
-                st.session_state.prev_portfolio = None
-                save_json(DB_FILE, st.session_state.portfolio)
-                st.success("仮想注文前の状態に戻しました")
-                st.rerun()
-            else:
-                st.error("戻せる状態がありません")
 
 rows = []
 row_keys = []  # rows[i] に対応する実際の portfolio キー（削除対象の特定に使う）
@@ -1628,6 +1521,114 @@ if rows:
         st.success(st.session_state.pop("_delete_stocks_success_msg"))
 else:
     st.info("銘柄がありません")
+
+# --- シート削除（現在表示中のバックアップと対応するスプレッドシートのデータを削除） ---
+@st.dialog("確認")
+def confirm_delete_sheet_dialog(target_idx):
+    st.write("現在表示中のバックアップと、対応するスプレッドシートのデータを削除しますか？")
+    st.caption("この操作は元に戻せません。")
+    col_ok, col_cancel = st.columns(2)
+    if col_ok.button("OK", use_container_width=True):
+        deleted = delete_backup_at_index(target_idx)
+        if deleted:
+            # ローカルの表示状態・キャッシュを破棄し、live編集用のportfolioに戻す
+            st.session_state.portfolio = load_json(DB_FILE, {})
+            st.session_state.events = load_json(EVENT_FILE, [])
+            st.session_state.reminder_text = load_json(REMINDER_FILE, "- ターゲット日程を入力してください")
+            st.session_state.backup_cache = {}
+            st.session_state.cache_min = None
+            st.session_state.cache_max = None
+            st.session_state.backup_total = None
+            st.session_state.backup_index = None
+            st.session_state["_delete_success_msg"] = "削除しました。データを再読み込みしました。"
+        st.rerun()
+    if col_cancel.button("Cancel", use_container_width=True):
+        st.rerun()
+
+if st.button("🗑️ シート削除"):
+    if st.session_state.backup_index is None:
+        st.warning("削除対象が選択されていません。先に「◀ 1つ前の設定」で対象のバックアップを表示してください。")
+    else:
+        confirm_delete_sheet_dialog(st.session_state.backup_index)
+
+# --- 仮想注文パネル（PC幅では画面右下に固定表示、スマホ幅では通常フロー） ---
+with st.container(key="floating_sim_panel"):
+    with st.expander("💰 仮想注文", expanded=False):
+        sim_amt_col, sim_cur_col = st.columns([2, 1])
+        sim_amount = sim_amt_col.number_input(
+            "投資金額", min_value=0.0, value=0.0, step=1000.0,
+            key="sim_amount", label_visibility="collapsed", placeholder="投資金額"
+        )
+        sim_currency_label = sim_cur_col.selectbox(
+            "単位", ["円", "ドル"], key="sim_currency", label_visibility="collapsed"
+        )
+        sim_currency = "JPY" if sim_currency_label == "円" else "USD"
+
+        sim_order_mode = st.radio(
+            "注文方法", ["即注文", "始値注文", "仲値注文", "終値注文"], index=0,
+            key="sim_order_mode", horizontal=True
+        )
+        if sim_order_mode == "仲値注文":
+            st.caption("※ 仲値注文は日本株のみ対応です（米国株は現在値で約定します）")
+
+        def business_days_back(base_date, n):
+            """base_dateからn営業日（土日を除く。日本の祝日は考慮しない簡易版）だけさかのぼった日付を返す"""
+            d = base_date
+            count = 0
+            while count < n:
+                d -= timedelta(days=1)
+                if d.weekday() < 5:  # 0=月曜〜4=金曜
+                    count += 1
+            return d
+
+        sim_min_date = business_days_back(now_jst().date(), 7)
+        sim_reference_date = st.date_input(
+            "基準日",
+            value=now_jst().date(),
+            min_value=sim_min_date,
+            max_value=now_jst().date(),
+            key="sim_reference_date",
+            disabled=(sim_order_mode == "即注文"),
+            help="始値注文・仲値注文・終値注文の基準となる日付（直近7営業日まで）。即注文では使用しません。"
+        )
+        if sim_order_mode == "仲値注文" and sim_reference_date < now_jst().date() - timedelta(days=7):
+            st.caption("⚠️ 仲値注文は暦日ベースで直近7日分のデータしか取得できないため、"
+                       "この基準日では取得できず現在値にフォールバックする可能性があります。")
+
+        sim_btn_col1, sim_btn_col2 = st.columns(2)
+        virtual_order_clicked = sim_btn_col1.button("仮想注文", use_container_width=True)
+        revert_clicked = sim_btn_col2.button("戻す", use_container_width=True)
+
+        if virtual_order_clicked:
+            if not sim_amount or sim_amount <= 0:
+                st.warning("投資金額を入力してください")
+            else:
+                success, result, min_needed = simulate_equal_investment(
+                    sim_amount, sim_currency, prices_dict, rate,
+                    order_mode=sim_order_mode, reference_date=sim_reference_date
+                )
+                if success:
+                    backup_portfolio()
+                    for key, r in result.items():
+                        st.session_state.portfolio[key]['shares'] = r['shares']
+                        st.session_state.portfolio[key]['cost'] = round(r['exec_price'], 2)
+                    save_json(DB_FILE, st.session_state.portfolio)
+                    ref_disp = sim_reference_date.strftime('%Y年%m月%d日') if sim_order_mode != "即注文" else ""
+                    st.success(f"{len(result)}銘柄に均等配分しました（{sim_order_mode}{' ' + ref_disp if ref_disp else ''}）")
+                    st.rerun()
+                else:
+                    unit = "円" if sim_currency == "JPY" else "ドル"
+                    st.error(f"投資金額が不足しています。最低 {min_needed:,.0f}{unit} 必要です。")
+
+        if revert_clicked:
+            if st.session_state.prev_portfolio is not None:
+                st.session_state.portfolio = copy.deepcopy(st.session_state.prev_portfolio)
+                st.session_state.prev_portfolio = None
+                save_json(DB_FILE, st.session_state.portfolio)
+                st.success("仮想注文前の状態に戻しました")
+                st.rerun()
+            else:
+                st.error("戻せる状態がありません")
 
 st.divider()
 
