@@ -304,6 +304,60 @@ def apply_backup_index(idx):
     save_json(EVENT_FILE, st.session_state.events)
     save_json(REMINDER_FILE, st.session_state.reminder_text)
 
+def render_backup_nav_controls(key_prefix=""):
+    """
+    「🔄 スプレッドシートを再読み込み」「◀ 1つ前の設定」「1つ後の設定 ▶」の3ボタンを描画する。
+    サイドバー・メイン画面など複数箇所から呼び出せるよう、ウィジェットキーの重複を避けるために
+    key_prefix を付与する（例: "sidebar_", "main_"）。
+    """
+    if st.button("🔄 スプレッドシートを再読み込み", key=f"{key_prefix}reload_btn"):
+        st.session_state.backup_cache = {}
+        st.session_state.cache_min = None
+        st.session_state.cache_max = None
+        if st.session_state.backup_index is not None:
+            # 現在表示中の位置を保ったまま、その周辺を最新の内容で読み直す
+            load_backup_window(center_idx=st.session_state.backup_index)
+        else:
+            load_backup_window(initial=True)
+        st.success("スプレッドシートを再読み込みしました")
+        st.rerun()
+
+    nav_col1, nav_col2 = st.columns(2)
+    prev_clicked = nav_col1.button("◀ 1つ前の設定", key=f"{key_prefix}prev_btn")
+    next_clicked = nav_col2.button("1つ後の設定 ▶", key=f"{key_prefix}next_btn")
+
+    if prev_clicked:
+        if st.session_state.backup_index is None:
+            if st.session_state.cache_min is not None and st.session_state.backup_total:
+                # 起動時にプリロード済みのキャッシュをそのまま使う（API呼び出し不要）
+                apply_backup_index(st.session_state.backup_total)
+            else:
+                # プリロードが未実施・失敗していた場合のフォールバック
+                load_backup_window(initial=True)
+        else:
+            target = st.session_state.backup_index - 1
+            if target < 1:
+                st.warning("これ以上前の履歴はありません")
+            elif target < st.session_state.cache_min:
+                load_backup_window(center_idx=target)
+            else:
+                apply_backup_index(target)
+        st.rerun()
+
+    if next_clicked:
+        if st.session_state.backup_index is None:
+            st.info("先に「◀ 1つ前の設定」を押してください")
+        else:
+            total = st.session_state.backup_total or st.session_state.backup_index
+            target = st.session_state.backup_index + 1
+            if target > total:
+                st.warning("これより新しい履歴はありません（最新のバックアップです）")
+            elif target > st.session_state.cache_max:
+                load_backup_window(center_idx=target)
+            else:
+                apply_backup_index(target)
+        st.rerun()
+
 # --- 1. セッション状態の初期化 ---
 if 'portfolio' not in st.session_state:
     st.session_state.portfolio = load_json(DB_FILE, {})
@@ -1068,55 +1122,8 @@ with st.sidebar:
         else:
             confirm_overwrite_dialog(full_config, st.session_state.backup_index)
 
-    # --- キャッシュ強制更新（他デバイスでの変更等をスプレッドシートから読み直す） ---
-    if st.button("🔄 スプレッドシートを再読み込み"):
-        st.session_state.backup_cache = {}
-        st.session_state.cache_min = None
-        st.session_state.cache_max = None
-        if st.session_state.backup_index is not None:
-            # 現在表示中の位置を保ったまま、その周辺を最新の内容で読み直す
-            load_backup_window(center_idx=st.session_state.backup_index)
-        else:
-            load_backup_window(initial=True)
-        st.success("スプレッドシートを再読み込みしました")
-        st.rerun()
-
-    # --- 前後ナビゲーション ---
-    nav_col1, nav_col2 = st.columns(2)
-    prev_clicked = nav_col1.button("◀ 1つ前の設定")
-    next_clicked = nav_col2.button("1つ後の設定 ▶")
-
-    if prev_clicked:
-        if st.session_state.backup_index is None:
-            if st.session_state.cache_min is not None and st.session_state.backup_total:
-                # 起動時にプリロード済みのキャッシュをそのまま使う（API呼び出し不要）
-                apply_backup_index(st.session_state.backup_total)
-            else:
-                # プリロードが未実施・失敗していた場合のフォールバック
-                load_backup_window(initial=True)
-        else:
-            target = st.session_state.backup_index - 1
-            if target < 1:
-                st.warning("これ以上前の履歴はありません")
-            elif target < st.session_state.cache_min:
-                load_backup_window(center_idx=target)
-            else:
-                apply_backup_index(target)
-        st.rerun()
-
-    if next_clicked:
-        if st.session_state.backup_index is None:
-            st.info("先に「◀ 1つ前の設定」を押してください")
-        else:
-            total = st.session_state.backup_total or st.session_state.backup_index
-            target = st.session_state.backup_index + 1
-            if target > total:
-                st.warning("これより新しい履歴はありません（最新のバックアップです）")
-            elif target > st.session_state.cache_max:
-                load_backup_window(center_idx=target)
-            else:
-                apply_backup_index(target)
-        st.rerun()
+    # --- キャッシュ強制更新・前後ナビゲーション ---
+    render_backup_nav_controls(key_prefix="sidebar_")
 
     # --- 現在表示中のバックアップ情報を表示（保存No. / 保存日付） ---
     if st.session_state.backup_index is not None:
@@ -1381,7 +1388,7 @@ def simulate_equal_investment(total_amount, input_currency, prices_dict, rate, o
 
     return True, result, 0
 
-col_refresh, col_ts = st.columns([1, 3])
+col_refresh, col_ts, col_quick_nav = st.columns([1, 2, 1.3])
 if col_refresh.button('最新価格に更新'):
     # キャッシュを明示的に破棄してから再実行（手動更新は必ず最新値を取りに行く）
     _fetch_prices_cached.clear()
@@ -1390,6 +1397,9 @@ if col_refresh.button('最新価格に更新'):
 prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys(), td_api_key=current_twelvedata_key)
 col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（15分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
+
+with col_quick_nav:
+    render_backup_nav_controls(key_prefix="main_")
 
 if "_delete_success_msg" in st.session_state:
     st.success(st.session_state.pop("_delete_success_msg"))
