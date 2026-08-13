@@ -306,7 +306,7 @@ def apply_backup_index(idx):
 
 def render_backup_nav_controls(key_prefix=""):
     """
-    「🔄 スプレッドシートを再読み込み」「◀ 1つ前の設定」「1つ後の設定 ▶」の3ボタンを描画する。
+    「🔄 スプレッドシートを再読み込み」「◀」「▶」の3ボタンを描画する。
     サイドバー・メイン画面など複数箇所から呼び出せるよう、ウィジェットキーの重複を避けるために
     key_prefix を付与する（例: "sidebar_", "main_"）。
     """
@@ -323,8 +323,8 @@ def render_backup_nav_controls(key_prefix=""):
         st.rerun()
 
     nav_col1, nav_col2 = st.columns(2)
-    prev_clicked = nav_col1.button("◀ 1つ前の設定", key=f"{key_prefix}prev_btn")
-    next_clicked = nav_col2.button("1つ後の設定 ▶", key=f"{key_prefix}next_btn")
+    prev_clicked = nav_col1.button("◀", key=f"{key_prefix}prev_btn", use_container_width=True)
+    next_clicked = nav_col2.button("▶", key=f"{key_prefix}next_btn", use_container_width=True)
 
     if prev_clicked:
         if st.session_state.backup_index is None:
@@ -930,10 +930,10 @@ components.html("""
                 return;
             }
             if (e.key === 'ArrowRight') {
-                clickButtonByText('1つ後の設定 ▶');
+                clickButtonByText('▶');
                 e.preventDefault();
             } else if (e.key === 'ArrowLeft') {
-                clickButtonByText('◀ 1つ前の設定');
+                clickButtonByText('◀');
                 e.preventDefault();
             }
         });
@@ -1400,6 +1400,7 @@ rate = prices_dict.get("USDJPY", 159.2)
 
 with col_quick_nav:
     render_backup_nav_controls(key_prefix="main_")
+    st.info(st.session_state.reminder_text)
 
 if "_delete_success_msg" in st.session_state:
     st.success(st.session_state.pop("_delete_success_msg"))
@@ -1665,9 +1666,6 @@ if st.session_state.events:
             except: pass
 
 st.divider()
-st.subheader("📋 Reminder")
-st.info(st.session_state.reminder_text)
-
 # --- 価格取得エラーの診断表示（原因調査用・画面最下部） ---
 st.divider()
 _fetch_errors = prices_dict.get("_fetch_errors", {})
