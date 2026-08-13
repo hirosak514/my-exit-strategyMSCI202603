@@ -322,9 +322,10 @@ def render_backup_nav_controls(key_prefix=""):
         st.success("スプレッドシートを再読み込みしました")
         st.rerun()
 
-    nav_col1, nav_col2 = st.columns(2)
-    prev_clicked = nav_col1.button("◀", key=f"{key_prefix}prev_btn", use_container_width=True)
-    next_clicked = nav_col2.button("▶", key=f"{key_prefix}next_btn", use_container_width=True)
+    with st.container(key=f"{key_prefix}nav_arrows_row"):
+        nav_col1, nav_col2 = st.columns(2)
+        prev_clicked = nav_col1.button("◀", key=f"{key_prefix}prev_btn", use_container_width=True)
+        next_clicked = nav_col2.button("▶", key=f"{key_prefix}next_btn", use_container_width=True)
 
     if prev_clicked:
         if st.session_state.backup_index is None:
@@ -898,6 +899,16 @@ st.markdown("""
             z-index: 9999;
         }
     }
+    /* ◀▶ナビゲーションボタンは、画面幅が狭くても常に横並びのままにする
+       （Streamlitの列は既定で狭い画面だと縦積みに折り返されるため、それを無効化する） */
+    div[class*="nav_arrows_row"] [data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important;
+    }
+    div[class*="nav_arrows_row"] [data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+        min-width: 0 !important;
+        width: 50% !important;
+        flex: 1 1 0 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1400,7 +1411,22 @@ rate = prices_dict.get("USDJPY", 159.2)
 
 with col_quick_nav:
     render_backup_nav_controls(key_prefix="main_")
-    st.info(st.session_state.reminder_text)
+
+    if st.session_state.backup_index is not None and st.session_state.backup_total:
+        position_str = f"{st.session_state.backup_index}/{st.session_state.backup_total}"
+    else:
+        position_str = "-/-"
+    # Streamlitのcolumnsは狭い画面で縦積みになるため、位置番号とリマインダー本文は
+    # 生のHTML(flex)で横並びにする（①のナビボタンと同じ理由）
+    reminder_html = (st.session_state.reminder_text or "").replace("\n", "<br>")
+    st.markdown(f"""
+    <div style="display:flex; align-items:flex-start; gap:10px;
+                background-color:rgba(28,131,225,0.1); border:1px solid rgba(28,131,225,0.4);
+                border-radius:8px; padding:10px 14px; margin-top:4px;">
+        <div style="font-weight:bold; white-space:nowrap; color:#4dabf7; flex-shrink:0;">{position_str}</div>
+        <div style="flex:1; word-break:break-word;">{reminder_html}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 if "_delete_success_msg" in st.session_state:
     st.success(st.session_state.pop("_delete_success_msg"))
