@@ -36,7 +36,9 @@ FIXED_SHEET_URL = "https://docs.google.com/spreadsheets/d/17kAFl14q8EaaQ6kvezlAe
 # --- バックアップ履歴 設定 ---
 MAX_BACKUPS = 1000          # 保持する最大バックアップ件数（超えたら古い順に削除）
 INITIAL_CACHE_SIZE = 10     # 初回「1つ前の設定」で読み込む件数（直近N件）
-WINDOW_CACHE_RADIUS = 10    # 範囲外アクセス時に読み込む前後件数（前後N件＝計2N件）
+WINDOW_CACHE_RADIUS = 10    # 範囲外アクセス時に読み込む前後件数（方向が分からない場合の対称フォールバック）
+DIRECTIONAL_LOOKAHEAD = 30  # 進行方向側に多めに読み込む件数（同方向への連続移動を高速化する）
+DIRECTIONAL_LOOKBEHIND = 3  # 進行方向と逆側は最小限だけ読み込む
 TIMESTAMP_FMT = "%Y-%m-%d %H:%M:%S"       # スプレッドシート保存用の内部フォーマット
 DISPLAY_FMT = "%Y年%m月%d日 %H:%M"         # ユーザー表示用のフォーマット
 
@@ -249,10 +251,15 @@ def preload_backup_cache():
         # 失敗してもアプリ本体の起動は妨げない（黙って諦める）
         pass
 
-def load_backup_window(center_idx=None, initial=False):
+def load_backup_window(center_idx=None, initial=False, direction=None):
     """
     initial=True: 直近 INITIAL_CACHE_SIZE 件を読み込み、最新（=1つ前）を適用
-    initial=False: center_idx の前後 WINDOW_CACHE_RADIUS 件（計最大2N件）を読み込む
+    initial=False: center_idx を基準に読み込む。
+        direction="next"（1つ後方向へ移動中）: 進行方向側に多め(DIRECTIONAL_LOOKAHEAD件)、
+            逆側は最小限(DIRECTIONAL_LOOKBEHIND件)だけ読み込む
+            → 同じ方向へ連続移動してもキャッシュ切れになりにくくする
+        direction="prev"（1つ前方向へ移動中）: 上記の前後を逆にする
+        direction=None: 前後対称（WINDOW_CACHE_RADIUS件ずつ）に読み込む
 
     既存のキャッシュと範囲が連続・重複する場合は、不足分だけをスプレッドシートから
     取得してマージする（境界付近を行き来した際に同じデータを再取得しないようにするため）。
@@ -275,8 +282,15 @@ def load_backup_window(center_idx=None, initial=False):
             end_idx = total
             target_idx = total  # 最新 = "1つ前"の最初の到達点
         else:
-            start_idx = max(1, center_idx - WINDOW_CACHE_RADIUS)
-            end_idx = min(total, center_idx + WINDOW_CACHE_RADIUS)
+            if direction == "next":
+                start_idx = max(1, center_idx - DIRECTIONAL_LOOKBEHIND)
+                end_idx = min(total, center_idx + DIRECTIONAL_LOOKAHEAD)
+            elif direction == "prev":
+                start_idx = max(1, center_idx - DIRECTIONAL_LOOKAHEAD)
+                end_idx = min(total, center_idx + DIRECTIONAL_LOOKBEHIND)
+            else:
+                start_idx = max(1, center_idx - WINDOW_CACHE_RADIUS)
+                end_idx = min(total, center_idx + WINDOW_CACHE_RADIUS)
             target_idx = center_idx
 
         existing_min = st.session_state.cache_min
@@ -370,7 +384,7 @@ def render_backup_nav_controls(key_prefix=""):
             if target < 1:
                 st.warning("これ以上前の履歴はありません")
             elif target < st.session_state.cache_min:
-                load_backup_window(center_idx=target)
+                load_backup_window(center_idx=target, direction="prev")
             else:
                 apply_backup_index(target)
         st.rerun()
@@ -384,7 +398,7 @@ def render_backup_nav_controls(key_prefix=""):
             if target > total:
                 st.warning("これより新しい履歴はありません（最新のバックアップです）")
             elif target > st.session_state.cache_max:
-                load_backup_window(center_idx=target)
+                load_backup_window(center_idx=target, direction="next")
             else:
                 apply_backup_index(target)
         st.rerun()
