@@ -253,6 +253,9 @@ def load_backup_window(center_idx=None, initial=False):
     """
     initial=True: 直近 INITIAL_CACHE_SIZE 件を読み込み、最新（=1つ前）を適用
     initial=False: center_idx の前後 WINDOW_CACHE_RADIUS 件（計最大2N件）を読み込む
+
+    既存のキャッシュと範囲が連続・重複する場合は、不足分だけをスプレッドシートから
+    取得してマージする（境界付近を行き来した際に同じデータを再取得しないようにするため）。
     """
     gc = get_gspread_client()
     if not gc: return
@@ -276,20 +279,50 @@ def load_backup_window(center_idx=None, initial=False):
             end_idx = min(total, center_idx + WINDOW_CACHE_RADIUS)
             target_idx = center_idx
 
-        cache, s, e = fetch_backup_range(ws, start_idx, end_idx, total)
-        if not cache:
+        existing_min = st.session_state.cache_min
+        existing_max = st.session_state.cache_max
+
+        if existing_min is not None and existing_max is not None \
+                and start_idx <= existing_max + 1 and end_idx >= existing_min - 1:
+            # 既存キャッシュと連続・重複 → 不足分だけ取得してマージする
+            fetch_ranges = []
+            if start_idx < existing_min:
+                fetch_ranges.append((start_idx, existing_min - 1))
+            if end_idx > existing_max:
+                fetch_ranges.append((existing_max + 1, end_idx))
+            new_min = min(existing_min, start_idx)
+            new_max = max(existing_max, end_idx)
+            merged_cache = dict(st.session_state.backup_cache)
+        else:
+            # 既存キャッシュと繋がらない → その範囲を丸ごと取得
+            fetch_ranges = [(start_idx, end_idx)]
+            new_min, new_max = start_idx, end_idx
+            merged_cache = {}
+
+        for s_idx, e_idx in fetch_ranges:
+            if s_idx > e_idx:
+                continue
+            cache, _, _ = fetch_backup_range(ws, s_idx, e_idx, total)
+            if cache:
+                merged_cache.update(cache)
+
+        if not merged_cache:
             st.warning("該当する履歴データが見つかりませんでした")
             return
 
-        st.session_state.backup_cache = cache
-        st.session_state.cache_min = s
-        st.session_state.cache_max = e
+        st.session_state.backup_cache = merged_cache
+        st.session_state.cache_min = new_min
+        st.session_state.cache_max = new_max
         apply_backup_index(target_idx)
     except Exception as e:
         st.error(f"履歴取得失敗: {e}")
 
 def apply_backup_index(idx):
-    """キャッシュ済みの idx 番目のバックアップをセッションに反映する"""
+    """
+    キャッシュ済みの idx 番目のバックアップをセッションに反映する。
+    閲覧中はディスクへの保存を行わない（毎回のボタン操作を軽くするため）。
+    メモリ上の「復元」用スナップショット（backup_portfolio）は従来通り取っておく。
+    """
     entry = st.session_state.backup_cache.get(idx)
     if not entry:
         st.warning("そのデータはまだキャッシュされていません")
@@ -300,9 +333,6 @@ def apply_backup_index(idx):
     st.session_state.events = data.get("events", [])
     st.session_state.reminder_text = data.get("reminder_text", "")
     st.session_state.backup_index = idx
-    save_json(DB_FILE, st.session_state.portfolio)
-    save_json(EVENT_FILE, st.session_state.events)
-    save_json(REMINDER_FILE, st.session_state.reminder_text)
 
 def render_backup_nav_controls(key_prefix=""):
     """
@@ -913,7 +943,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- キーボードショートカット（← → で バックアップ履歴を前後に移動） ---
-components.html("""
+# 親ドキュメント側にリスナーが一度インストールされれば、以降のrerunで再注入する必要はない。
+# 毎回iframeを作り直すコストを避けるため、セッション中は最初の1回だけレンダリングする。
+if not st.session_state.get('_keyboard_shortcut_installed', False):
+    components.html("""
 <script>
 (function() {
     function tryInstall() {
@@ -968,6 +1001,7 @@ components.html("""
 })();
 </script>
 """, height=0)
+    st.session_state['_keyboard_shortcut_installed'] = True
 
 with st.sidebar:
     st.header("🔑 Settings")
