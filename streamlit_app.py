@@ -306,7 +306,7 @@ def load_backup_window(center_idx=None, initial=False, direction=None):
                 fetch_ranges.append((existing_max + 1, end_idx))
             new_min = min(existing_min, start_idx)
             new_max = max(existing_max, end_idx)
-            merged_cache = dict(st.session_state.backup_cache)
+            merged_cache = st.session_state.backup_cache  # コピーせず直接追記する（キャッシュ肥大時のO(n)コピーを回避）
         else:
             # 既存キャッシュと繋がらない → その範囲を丸ごと取得
             fetch_ranges = [(start_idx, end_idx)]
@@ -391,7 +391,12 @@ def render_backup_nav_controls(key_prefix=""):
 
     if next_clicked:
         if st.session_state.backup_index is None:
-            st.info("先に「◀ 1つ前の設定」を押してください")
+            if st.session_state.cache_min is not None and st.session_state.backup_total:
+                # 起動時にプリロード済みのキャッシュをそのまま使う（API呼び出し不要）
+                apply_backup_index(st.session_state.backup_total)
+            else:
+                # プリロードが未実施・失敗していた場合のフォールバック
+                load_backup_window(initial=True)
         else:
             total = st.session_state.backup_total or st.session_state.backup_index
             target = st.session_state.backup_index + 1
