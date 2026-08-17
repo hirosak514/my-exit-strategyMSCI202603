@@ -730,156 +730,179 @@ def fetch_twelvedata_quotes(portfolio_keys, api_key):
 
     return results
 
+def _fetch_single_symbol_price(key, td_api_key):
+    """
+    1銘柄分の価格を、優先順位（Twelve Data → .info → metadata → fast_info → history）で取得する。
+    この関数自体はキャッシュされない「生」の取得処理。time.sleepもここに置くことで、
+    キャッシュ経由の呼び出し（下の _fetch_single_symbol_price_cached）がヒットした場合は
+    実行されず、実際にネットワークへ取りに行った時だけ待機するようにする。
+    戻り値: (price_dict または None, debug_msg, error_msg)
+    """
+    symbol = key.split('_')[0]
+    is_japan = symbol.isdigit() and len(symbol) == 4
+    ticker = f"{symbol}.T" if is_japan else ("7013.T" if symbol == "IHI" else symbol)
+    error_msg = ""
+
+    # --- 0. Twelve Data（設定されている場合のみ） ---
+    if td_api_key:
+        try:
+            td_result = fetch_twelvedata_quotes([key], td_api_key)
+            if key in td_result:
+                r = td_result[key]
+                time.sleep(0.1)
+                return r, f"[twelvedata] 現在値={r['current']} 前日終値={r['prev_close']}", ""
+        except Exception as e:
+            error_msg += f" / [twelvedata] {type(e).__name__}: {e}"
+
+    got_price = False
+    result = None
+    debug_msg = ""
+
+    # --- 1. .info（v7/finance/quote エンドポイント）を最優先で試す ---
+    # (get_history_metadata / fast_info / history は、実は全て同じ「チャート用API」を
+    #  内部で共有しており、見た目は別ルートでも実体は同一データだった。
+    #  .info は quoteSummary + v7/finance/quote という完全に別のAPIを叩くため、
+    #  ここでようやく本当に独立した気配値が期待できる。ただし重い呼び出しなので
+    #  失敗時は下位のフォールバックに切り替える)
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        cur = info.get("regularMarketPrice") if info else None
+        if cur is None and info:
+            cur = info.get("currentPrice")
+        prev = info.get("regularMarketPreviousClose") if info else None
+        if prev is None and info:
+            prev = info.get("previousClose")
+        if cur is not None and not pd.isna(cur):
+            result = {"current": cur, "prev_close": prev}
+            debug_msg = f"[info] 現在値={cur} 前日終値={prev}"
+            got_price = True
+    except Exception as e:
+        error_msg += f" / [info] {type(e).__name__}: {e}"
+
+    # --- 2. .info が使えない場合は get_history_metadata() の regularMarketPrice を試す ---
+    if not got_price:
+        try:
+            stock = yf.Ticker(ticker)
+            md = stock.get_history_metadata()
+            cur = md.get("regularMarketPrice") if md else None
+            prev = md.get("chartPreviousClose") if md else None
+            if prev is None and md:
+                prev = md.get("previousClose")
+            if cur is not None and not pd.isna(cur):
+                result = {"current": cur, "prev_close": prev}
+                debug_msg = f"[metadata] 現在値={cur} 前日終値={prev}"
+                got_price = True
+        except Exception as e:
+            error_msg += f" / [metadata] {type(e).__name__}: {e}"
+
+    if not got_price:
+        # --- 3. metadataも使えない場合は fast_info を試す ---
+        try:
+            stock = yf.Ticker(ticker)
+            fi = stock.fast_info
+            cur = fi.get("lastPrice") if fi else None
+            prev = fi.get("previousClose") if fi else None
+            if cur is not None and not pd.isna(cur):
+                result = {"current": cur, "prev_close": prev}
+                debug_msg = f"[fast_info] 現在値={cur:.2f} 前日終値={prev}"
+                got_price = True
+        except Exception as e:
+            error_msg += f" / [fast_info] {type(e).__name__}: {e}"
+
+    if not got_price:
+        # --- 4. それでもダメなら従来の日足取得にフォールバック ---
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="5d")
+            if not hist.empty:
+                last_close = hist['Close'].iloc[-1]
+                last_dt = hist.index[-1]
+                result = {
+                    "current": last_close,
+                    "prev_close": hist['Close'].iloc[-2] if len(hist) >= 2 else None
+                }
+                debug_msg = f"[history フォールバック] {last_dt} 終値={last_close:.2f}（{len(hist)}本取得）"
+                got_price = True
+            else:
+                error_msg += " / 空のデータが返されました（レート制限の可能性）"
+        except Exception as e:
+            error_msg += f" / [history] {type(e).__name__}: {e}"
+
+    time.sleep(0.3)  # 実際にネットワークへ取りに行った場合のみ待機（レート制限対策）
+    return result, debug_msg, error_msg.strip(" /")
+
+def _fetch_usdjpy_rate(td_api_key):
+    """USD/JPY為替レートを取得する（Twelve Data優先、ダメならYahooにフォールバック）"""
+    if td_api_key:
+        try:
+            resp = requests.get(f"{TWELVEDATA_BASE_URL}/quote", params={"symbol": "USD/JPY", "apikey": td_api_key}, timeout=10)
+            fx_data = resp.json()
+            if isinstance(fx_data, dict) and fx_data.get("status") != "error" and "close" in fx_data:
+                return float(fx_data["close"]), ""
+        except Exception as e:
+            pass  # 下のフォールバックへ
+
+    try:
+        usdjpy_md = yf.Ticker("JPY=X").get_history_metadata()
+        rate = usdjpy_md.get("regularMarketPrice", 159.2) if usdjpy_md else 159.2
+        return rate, ""
+    except Exception:
+        try:
+            usdjpy = yf.Ticker("JPY=X").history(period="5d")
+            rate = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
+            return rate, ""
+        except Exception as e:
+            return 159.2, f"{type(e).__name__}: {e}"
+
+PRICE_CACHE_TTL_SECONDS = 900  # 15分
+
+@st.cache_data(ttl=PRICE_CACHE_TTL_SECONDS, show_spinner=False)
+def _fetch_single_symbol_price_cached(key, td_api_key):
+    """
+    銘柄1つ単位で価格をキャッシュする。
+    バックアップ履歴を移動して保有銘柄構成が変わっても、共通する銘柄はこのキャッシュを
+    使い回せるため、銘柄セット全体をキーにしていた以前の方式より無駄な再取得が大幅に減る。
+    """
+    return _fetch_single_symbol_price(key, td_api_key)
+
+@st.cache_data(ttl=PRICE_CACHE_TTL_SECONDS, show_spinner=False)
+def _fetch_usdjpy_rate_cached(td_api_key):
+    return _fetch_usdjpy_rate(td_api_key)
+
 def get_live_prices(portfolio_keys, td_api_key=None):
     prices = {}
     fetch_errors = {}   # デバッグ用：銘柄ごとの失敗理由を記録
     fetch_debug = {}    # デバッグ用：成功時も含め、取得元・値を記録
     portfolio_keys = list(portfolio_keys)
 
-    # --- 0. まず Twelve Data でまとめて取得を試す（設定されている場合のみ） ---
-    td_results = {}
-    if td_api_key:
-        try:
-            td_results = fetch_twelvedata_quotes(portfolio_keys, td_api_key)
-        except Exception as e:
-            fetch_errors["_twelvedata"] = f"{type(e).__name__}: {e}"
-
     for key in portfolio_keys:
-        if key in td_results:
-            prices[key] = td_results[key]
-            fetch_debug[key] = f"[twelvedata] 現在値={td_results[key]['current']} 前日終値={td_results[key]['prev_close']}"
-            continue  # Twelve Dataで取得できた銘柄はYahooに問い合わせない
+        result, debug_msg, error_msg = _fetch_single_symbol_price_cached(key, td_api_key)
+        prices[key] = result
+        if debug_msg:
+            fetch_debug[key] = debug_msg
+        if error_msg:
+            fetch_errors[key] = error_msg
 
-        symbol = key.split('_')[0]
-        is_japan = symbol.isdigit() and len(symbol) == 4
-        ticker = f"{symbol}.T" if is_japan else ("7013.T" if symbol == "IHI" else symbol)
-
-        got_price = False
-
-        # --- 1. .info（v7/finance/quote エンドポイント）を最優先で試す ---
-        # (get_history_metadata / fast_info / history は、実は全て同じ「チャート用API」を
-        #  内部で共有しており、見た目は別ルートでも実体は同一データだった。
-        #  .info は quoteSummary + v7/finance/quote という完全に別のAPIを叩くため、
-        #  ここでようやく本当に独立した気配値が期待できる。ただし重い呼び出しなので
-        #  失敗時は下位のフォールバックに切り替える)
-        try:
-            stock = yf.Ticker(ticker)
-            info = stock.info
-            cur = info.get("regularMarketPrice") if info else None
-            if cur is None and info:
-                cur = info.get("currentPrice")
-            prev = info.get("regularMarketPreviousClose") if info else None
-            if prev is None and info:
-                prev = info.get("previousClose")
-            if cur is not None and not pd.isna(cur):
-                prices[key] = {"current": cur, "prev_close": prev}
-                fetch_debug[key] = f"[info] 現在値={cur} 前日終値={prev}"
-                got_price = True
-        except Exception as e:
-            fetch_errors[key] = f"[info] {type(e).__name__}: {e}"
-
-        # --- 2. .info が使えない場合は get_history_metadata() の regularMarketPrice を試す ---
-        # (fast_info.last_price は内部的に history() の日足終値をそのまま使っているだけで、
-        #  実は取引時間中でも更新されないことが判明。regularMarketPrice は
-        #  Yahoo Financeが返す実際の気配値そのものなので、historyの日足よりは新しいはず)
-        if not got_price:
-            try:
-                stock = yf.Ticker(ticker)
-                md = stock.get_history_metadata()
-                cur = md.get("regularMarketPrice") if md else None
-                prev = md.get("chartPreviousClose") if md else None
-                if prev is None and md:
-                    prev = md.get("previousClose")
-                if cur is not None and not pd.isna(cur):
-                    prices[key] = {"current": cur, "prev_close": prev}
-                    fetch_debug[key] = f"[metadata] 現在値={cur} 前日終値={prev}"
-                    got_price = True
-            except Exception as e:
-                fetch_errors[key] = fetch_errors.get(key, "") + f" / [metadata] {type(e).__name__}: {e}"
-
-        if not got_price:
-            # --- 3. metadataも使えない場合は fast_info を試す ---
-            try:
-                stock = yf.Ticker(ticker)
-                fi = stock.fast_info
-                cur = fi.get("lastPrice") if fi else None
-                prev = fi.get("previousClose") if fi else None
-                if cur is not None and not pd.isna(cur):
-                    prices[key] = {"current": cur, "prev_close": prev}
-                    fetch_debug[key] = f"[fast_info] 現在値={cur:.2f} 前日終値={prev}"
-                    got_price = True
-            except Exception as e:
-                fetch_errors[key] = fetch_errors.get(key, "") + f" / [fast_info] {type(e).__name__}: {e}"
-
-        if not got_price:
-            # --- 4. それでもダメなら従来の日足取得にフォールバック ---
-            try:
-                stock = yf.Ticker(ticker)
-                hist = stock.history(period="5d")
-                if not hist.empty:
-                    last_close = hist['Close'].iloc[-1]
-                    last_dt = hist.index[-1]
-                    prices[key] = {
-                        "current": last_close,
-                        "prev_close": hist['Close'].iloc[-2] if len(hist) >= 2 else None
-                    }
-                    fetch_debug[key] = f"[history フォールバック] {last_dt} 終値={last_close:.2f}（{len(hist)}本取得）"
-                    got_price = True
-                else:
-                    prices[key] = None
-                    fetch_errors[key] = fetch_errors.get(key, "") + " / 空のデータが返されました（レート制限の可能性）"
-            except Exception as e:
-                prices[key] = None
-                fetch_errors[key] = fetch_errors.get(key, "") + f" / [history] {type(e).__name__}: {e}"
-
-        time.sleep(0.3)  # .info は複数リクエストが飛ぶ重い呼び出しのため、間隔を少し長めに
-
-    # --- USD/JPY為替レートもTwelve Data優先、ダメならYahooにフォールバック ---
-    usdjpy_from_td = None
-    if td_api_key:
-        try:
-            resp = requests.get(f"{TWELVEDATA_BASE_URL}/quote", params={"symbol": "USD/JPY", "apikey": td_api_key}, timeout=10)
-            fx_data = resp.json()
-            if isinstance(fx_data, dict) and fx_data.get("status") != "error" and "close" in fx_data:
-                usdjpy_from_td = float(fx_data["close"])
-        except Exception as e:
-            fetch_errors["USDJPY"] = f"[twelvedata] {type(e).__name__}: {e}"
-
-    if usdjpy_from_td is not None:
-        prices["USDJPY"] = usdjpy_from_td
-    else:
-        try:
-            usdjpy_md = yf.Ticker("JPY=X").get_history_metadata()
-            prices["USDJPY"] = usdjpy_md.get("regularMarketPrice", 159.2) if usdjpy_md else 159.2
-        except Exception:
-            try:
-                usdjpy = yf.Ticker("JPY=X").history(period="5d")
-                prices["USDJPY"] = usdjpy['Close'].iloc[-1] if not usdjpy.empty else 159.2
-            except Exception as e:
-                prices["USDJPY"] = 159.2
-                fetch_errors["USDJPY"] = fetch_errors.get("USDJPY", "") + f" / {type(e).__name__}: {e}"
+    rate, rate_error = _fetch_usdjpy_rate_cached(td_api_key)
+    prices["USDJPY"] = rate
+    if rate_error:
+        fetch_errors["USDJPY"] = rate_error
 
     prices["_fetch_errors"] = fetch_errors
     prices["_fetch_debug"] = fetch_debug
     return prices
 
-PRICE_CACHE_TTL_SECONDS = 900  # 15分
-
-@st.cache_data(ttl=PRICE_CACHE_TTL_SECONDS, show_spinner=False)
-def _fetch_prices_cached(keys_tuple, td_api_key):
-    """get_live_prices の結果を15分間キャッシュする。取得時刻も併せて返す。"""
-    prices = get_live_prices(list(keys_tuple), td_api_key=td_api_key)
-    return prices, now_jst()
-
 def get_prices_with_cache(portfolio_keys, td_api_key=None):
     """
-    ポートフォリオのキー集合から価格を取得する（15分キャッシュ付き）。
+    ポートフォリオのキー集合から価格を取得する（銘柄単位で15分キャッシュ）。
     戻り値: (prices_dict, last_updated_datetime)
     """
     keys_tuple = tuple(sorted(portfolio_keys))
     if not keys_tuple:
         return {"USDJPY": 159.2}, now_jst()
-    return _fetch_prices_cached(keys_tuple, td_api_key)
+    prices = get_live_prices(keys_tuple, td_api_key=td_api_key)
+    return prices, now_jst()
 
 # 【オリジナルを完全踏襲】
 def analyze_multiple_images(uploaded_files):
@@ -1459,7 +1482,8 @@ def simulate_equal_investment(total_amount, input_currency, prices_dict, rate, o
 col_refresh, col_ts, col_quick_nav = st.columns([1, 2, 1.3])
 if col_refresh.button('最新価格に更新'):
     # キャッシュを明示的に破棄してから再実行（手動更新は必ず最新値を取りに行く）
-    _fetch_prices_cached.clear()
+    _fetch_single_symbol_price_cached.clear()
+    _fetch_usdjpy_rate_cached.clear()
     st.rerun()
 
 prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys(), td_api_key=current_twelvedata_key)
