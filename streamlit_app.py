@@ -1228,6 +1228,10 @@ with st.sidebar:
             total_disp = st.session_state.backup_total or "?"
             st.info(f"📌 保存No.: **{st.session_state.backup_index} / {total_disp}**\n\n"
                     f"📅 保存日付: **{display_ts}**")
+            # --- デバッグ用：実際にキャッシュされている件数・範囲を可視化 ---
+            st.caption(f"🔍 デバッグ: 実キャッシュ件数={len(st.session_state.backup_cache)}件 "
+                       f"/ cache_min={st.session_state.cache_min} / cache_max={st.session_state.cache_max} "
+                       f"/ キー一覧={sorted(st.session_state.backup_cache.keys())}")
     else:
         st.caption("バックアップ履歴はまだ読み込まれていません（「◀ 1つ前の設定」を押すと表示されます）")
 
