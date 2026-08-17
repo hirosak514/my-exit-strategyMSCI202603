@@ -15,6 +15,7 @@ from streamlit_autorefresh import st_autorefresh
 import streamlit.components.v1 as components
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 0. データの保存・読み込み ---
 DB_FILE = "portfolio.json"
@@ -876,13 +877,27 @@ def get_live_prices(portfolio_keys, td_api_key=None):
     fetch_debug = {}    # デバッグ用：成功時も含め、取得元・値を記録
     portfolio_keys = list(portfolio_keys)
 
-    for key in portfolio_keys:
-        result, debug_msg, error_msg = _fetch_single_symbol_price_cached(key, td_api_key)
-        prices[key] = result
-        if debug_msg:
-            fetch_debug[key] = debug_msg
-        if error_msg:
-            fetch_errors[key] = error_msg
+    if portfolio_keys:
+        # 銘柄ごとの取得はネットワークI/O待ちが支配的なので、並列化して大幅に高速化する。
+        # （st.cache_dataでヒットする銘柄は即座に返るが、未キャッシュの銘柄が多いバックアップに
+        #  切り替えた際、逐次処理だと銘柄数×待機時間の分だけ直列に遅くなっていたため）
+        max_workers = min(8, len(portfolio_keys))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_key = {
+                executor.submit(_fetch_single_symbol_price_cached, key, td_api_key): key
+                for key in portfolio_keys
+            }
+            for future in as_completed(future_to_key):
+                key = future_to_key[future]
+                try:
+                    result, debug_msg, error_msg = future.result()
+                except Exception as e:
+                    result, debug_msg, error_msg = None, "", f"{type(e).__name__}: {e}"
+                prices[key] = result
+                if debug_msg:
+                    fetch_debug[key] = debug_msg
+                if error_msg:
+                    fetch_errors[key] = error_msg
 
     rate, rate_error = _fetch_usdjpy_rate_cached(td_api_key)
     prices["USDJPY"] = rate
@@ -1228,10 +1243,6 @@ with st.sidebar:
             total_disp = st.session_state.backup_total or "?"
             st.info(f"📌 保存No.: **{st.session_state.backup_index} / {total_disp}**\n\n"
                     f"📅 保存日付: **{display_ts}**")
-            # --- デバッグ用：実際にキャッシュされている件数・範囲を可視化 ---
-            st.caption(f"🔍 デバッグ: 実キャッシュ件数={len(st.session_state.backup_cache)}件 "
-                       f"/ cache_min={st.session_state.cache_min} / cache_max={st.session_state.cache_max} "
-                       f"/ キー一覧={sorted(st.session_state.backup_cache.keys())}")
     else:
         st.caption("バックアップ履歴はまだ読み込まれていません（「◀ 1つ前の設定」を押すと表示されます）")
 
