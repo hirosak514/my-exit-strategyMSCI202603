@@ -962,10 +962,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- キーボードショートカット（← → で バックアップ履歴を前後に移動） ---
-# 親ドキュメント側にリスナーが一度インストールされれば、以降のrerunで再注入する必要はない。
-# 毎回iframeを作り直すコストを避けるため、セッション中は最初の1回だけレンダリングする。
-if not st.session_state.get('_keyboard_shortcut_installed', False):
-    components.html("""
+# 親ドキュメント側の __backupNavKeyListenerInstalled フラグにより、実際のリスナー登録は
+# 初回成功時の1回だけに抑えられる。そのため、Python側で「1回だけ描画」に絞り込む最適化は
+# 撤回する（1回目の描画・インストールが何らかの理由で失敗すると、以降ずっと矢印キーが
+# 反応しなくなる不具合につながっていたため）。
+components.html("""
 <script>
 (function() {
     function tryInstall() {
@@ -981,8 +982,12 @@ if not st.session_state.get('_keyboard_shortcut_installed', False):
 
         function clickButtonByText(text) {
             const buttons = Array.from(doc.querySelectorAll('button'));
-            const target = buttons.find(btn => btn.innerText.trim() === text);
-            if (target) { target.click(); }
+            const matches = buttons.filter(btn => btn.innerText.trim() === text);
+            if (matches.length === 0) { return; }
+            // サイドバー・メイン画面に同名ボタンが重複しているため、
+            // 非表示（折りたたみ等で offsetParent が null）のものは避け、見えている方を優先する
+            const visible = matches.find(btn => btn.offsetParent !== null);
+            (visible || matches[0]).click();
         }
 
         doc.addEventListener('keydown', function(e) {
@@ -1020,7 +1025,6 @@ if not st.session_state.get('_keyboard_shortcut_installed', False):
 })();
 </script>
 """, height=0)
-    st.session_state['_keyboard_shortcut_installed'] = True
 
 with st.sidebar:
     st.header("🔑 Settings")
