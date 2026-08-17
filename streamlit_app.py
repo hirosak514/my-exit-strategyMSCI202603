@@ -409,6 +409,118 @@ def render_backup_nav_controls(key_prefix=""):
                 apply_backup_index(target)
         st.rerun()
 
+def jump_to_backup_index(target_idx):
+    """
+    指定した絶対インデックスへジャンプする。
+    既にキャッシュ範囲内ならAPI呼び出しなしで即座に反映し、範囲外ならその周辺を取得する。
+    """
+    if st.session_state.backup_total is None or target_idx is None:
+        st.warning("バックアップ履歴の総件数が不明です。先に「🔄 スプレッドシートを再読み込み」を押してください。")
+        return
+    target_idx = max(1, min(st.session_state.backup_total, int(target_idx)))
+    if st.session_state.cache_min is not None and st.session_state.cache_max is not None \
+            and st.session_state.cache_min <= target_idx <= st.session_state.cache_max:
+        apply_backup_index(target_idx)
+    else:
+        load_backup_window(center_idx=target_idx)
+
+def find_backup_index_by_date(target_date):
+    """
+    スプレッドシートのA列（タイムスタンプ）だけを読み、target_date（日付のみ、時刻は無視）に
+    一致する最後のバックアップの絶対インデックスを返す。
+    完全一致が無ければ、日付が一番近いものを返す。
+    戻り値: (idx, actual_date) または (None, None)（失敗時・データなし）
+    """
+    gc = get_gspread_client()
+    if not gc:
+        return None, None
+    try:
+        sh = gc.open_by_url(FIXED_SHEET_URL)
+        ws = sh.get_worksheet(0)
+        ensure_header(ws)
+        col = ws.col_values(1)  # ヘッダー込み。A列だけなので軽量
+    except Exception:
+        return None, None
+    if len(col) <= 1:
+        return None, None
+
+    parsed = []  # [(idx, date), ...]
+    for i, ts in enumerate(col[1:], start=1):
+        try:
+            dt = datetime.strptime(ts, TIMESTAMP_FMT)
+            parsed.append((i, dt.date()))
+        except Exception:
+            continue
+    if not parsed:
+        return None, None
+
+    # 同じ日付が複数あれば、一番新しい（その日の最後の）ものを選ぶ
+    exact_matches = [p for p in parsed if p[1] == target_date]
+    if exact_matches:
+        return exact_matches[-1]
+
+    # 完全一致が無ければ、日付が一番近いものにフォールバック
+    return min(parsed, key=lambda p: abs((p[1] - target_date).days))
+
+def render_backup_jump_controls(key_prefix=""):
+    """
+    「⏮ 最古 / ⏭ 最新」「No.でジャンプ」「日付でジャンプ」の3種類のジャンプ機能を描画する。
+    バックアップ件数が数百〜千件規模になっても、目的の位置に少ないクリックで到達できるようにする。
+    """
+    if "_jump_msg" in st.session_state:
+        st.info(st.session_state.pop("_jump_msg"))
+
+    st.markdown("**バックアップへジャンプ**")
+
+    # --- 最古 / 最新 ---
+    jump_col1, jump_col2 = st.columns(2)
+    if jump_col1.button("⏮ 最古", key=f"{key_prefix}jump_oldest_btn", use_container_width=True):
+        if st.session_state.backup_total is None:
+            load_backup_window(initial=True)
+        jump_to_backup_index(1)
+        st.rerun()
+    if jump_col2.button("⏭ 最新", key=f"{key_prefix}jump_newest_btn", use_container_width=True):
+        if st.session_state.backup_total is None:
+            load_backup_window(initial=True)
+        else:
+            jump_to_backup_index(st.session_state.backup_total)
+        st.rerun()
+
+    if not st.session_state.backup_total:
+        st.caption("履歴を一度読み込むと、No.・日付でのジャンプも使えるようになります。")
+        return
+
+    # --- No.直接指定でジャンプ ---
+    no_col1, no_col2 = st.columns([2, 1])
+    max_no = st.session_state.backup_total
+    default_no = min(st.session_state.backup_index or 1, max_no)
+    jump_no = no_col1.number_input(
+        "No.でジャンプ", min_value=1, max_value=max_no, value=default_no,
+        step=1, key=f"{key_prefix}jump_no_input", label_visibility="collapsed"
+    )
+    if no_col2.button("移動", key=f"{key_prefix}jump_no_btn", use_container_width=True):
+        jump_to_backup_index(int(jump_no))
+        st.rerun()
+
+    # --- 日付でジャンプ ---
+    date_col1, date_col2 = st.columns([2, 1])
+    jump_date = date_col1.date_input(
+        "日付でジャンプ", value=now_jst().date(),
+        key=f"{key_prefix}jump_date_input", label_visibility="collapsed"
+    )
+    if date_col2.button("検索", key=f"{key_prefix}jump_date_btn", use_container_width=True):
+        idx, actual_date = find_backup_index_by_date(jump_date)
+        if idx is None:
+            st.warning("該当するバックアップが見つかりませんでした")
+        else:
+            jump_to_backup_index(idx)
+            if actual_date != jump_date:
+                st.session_state["_jump_msg"] = (
+                    f"指定日にはデータが無かったため、最も近い"
+                    f"{actual_date.strftime('%Y年%m月%d日')}のバックアップへ移動しました"
+                )
+        st.rerun()
+
 # --- 1. セッション状態の初期化 ---
 if 'portfolio' not in st.session_state:
     st.session_state.portfolio = load_json(DB_FILE, {})
@@ -1230,6 +1342,9 @@ with st.sidebar:
 
     # --- キャッシュ強制更新・前後ナビゲーション ---
     render_backup_nav_controls(key_prefix="sidebar_")
+
+    # --- ジャンプ機能（件数が多くなっても目的のバックアップへ素早く到達できるようにする） ---
+    render_backup_jump_controls(key_prefix="sidebar_")
 
     # --- 現在表示中のバックアップ情報を表示（保存No. / 保存日付） ---
     if st.session_state.backup_index is not None:
