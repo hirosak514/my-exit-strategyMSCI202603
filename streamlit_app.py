@@ -1716,7 +1716,7 @@ for i, (key, info) in enumerate(st.session_state.portfolio.items()):
         "選択": False,
         "No.": i + 1, "銘柄": display_name, "数量": shares, "区分": display_label,
         "取得単価": cost_display, "現在値 (前日比)": cur_display,
-        "損益(円)": f"¥{p_jpy:,.0f}" if (shares == 0 or price_available) else "¥0（未反映）"
+        "損益(円)": p_jpy if (shares == 0 or price_available) else 0
     })
 
 m_col1, m_col2 = st.columns(2)
@@ -1736,6 +1736,7 @@ if rows:
         df_display,
         column_config={
             "選択": st.column_config.CheckboxColumn("選択", default=False, width="small"),
+            "損益(円)": st.column_config.NumberColumn("損益(円)", format="¥%,.0f"),
         },
         disabled=["No.", "銘柄", "数量", "区分", "取得単価", "現在値 (前日比)", "損益(円)"],
         hide_index=True,
