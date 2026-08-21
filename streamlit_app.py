@@ -217,6 +217,10 @@ def export_to_spreadsheet(data):
         st.session_state.cache_max = None
         st.session_state.backup_index = None
 
+        # 保存直後に自動でスプレッドシートを再読み込みし、
+        # 今保存したばかりのバックアップがすぐに閲覧できる状態にしておく
+        load_backup_window(initial=True)
+
         display_ts = datetime.strptime(timestamp, TIMESTAMP_FMT).strftime(DISPLAY_FMT)
         st.success(f"バックアップを保存しました（{display_ts}）")
     except Exception as e:
@@ -1312,14 +1316,16 @@ with st.sidebar:
         if col_ok.button("OK", use_container_width=True):
             written_ts = overwrite_backup_at_index(target_idx, data_to_write)
             if written_ts:
-                entry = st.session_state.backup_cache.get(target_idx)
-                if entry:
-                    entry["data"] = data_to_write
                 try:
                     display_ts = datetime.strptime(written_ts, TIMESTAMP_FMT).strftime(DISPLAY_FMT)
                 except Exception:
                     display_ts = written_ts
                 st.session_state["_overwrite_success_msg"] = f"バックアップを上書きしました（{display_ts}）"
+                # 上書き直後に自動でスプレッドシートを再読み込みし、キャッシュをサーバーの内容と揃える
+                st.session_state.backup_cache = {}
+                st.session_state.cache_min = None
+                st.session_state.cache_max = None
+                load_backup_window(center_idx=target_idx)
             st.rerun()
         if col_cancel.button("Cancel", use_container_width=True):
             st.rerun()
