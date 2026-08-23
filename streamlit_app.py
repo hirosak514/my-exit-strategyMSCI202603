@@ -377,7 +377,21 @@ def render_backup_nav_controls(key_prefix=""):
         next_clicked = nav_col2.button("▶", key=f"{key_prefix}next_btn", use_container_width=True)
 
     if prev_clicked:
-        if st.session_state.backup_index is None:
+        if st.session_state.backup_filter_indices is not None:
+            # --- リマインダー検索フィルターが有効な場合：フィルター内でのみ前後移動 ---
+            filt = st.session_state.backup_filter_indices
+            pos = st.session_state.backup_filter_pos
+            if not filt:
+                st.warning("フィルター条件に一致するバックアップがありません")
+            elif pos is None:
+                st.session_state.backup_filter_pos = len(filt) - 1
+                jump_to_backup_index(filt[-1], clear_filter=False)
+            elif pos <= 0:
+                st.warning("フィルター条件に一致する、これより前のバックアップはありません")
+            else:
+                st.session_state.backup_filter_pos = pos - 1
+                jump_to_backup_index(filt[pos - 1], clear_filter=False)
+        elif st.session_state.backup_index is None:
             if st.session_state.cache_min is not None and st.session_state.backup_total:
                 # 起動時にプリロード済みのキャッシュをそのまま使う（API呼び出し不要）
                 apply_backup_index(st.session_state.backup_total)
@@ -395,7 +409,21 @@ def render_backup_nav_controls(key_prefix=""):
         st.rerun()
 
     if next_clicked:
-        if st.session_state.backup_index is None:
+        if st.session_state.backup_filter_indices is not None:
+            # --- リマインダー検索フィルターが有効な場合：フィルター内でのみ前後移動 ---
+            filt = st.session_state.backup_filter_indices
+            pos = st.session_state.backup_filter_pos
+            if not filt:
+                st.warning("フィルター条件に一致するバックアップがありません")
+            elif pos is None:
+                st.session_state.backup_filter_pos = 0
+                jump_to_backup_index(filt[0], clear_filter=False)
+            elif pos >= len(filt) - 1:
+                st.warning("フィルター条件に一致する、これより後のバックアップはありません")
+            else:
+                st.session_state.backup_filter_pos = pos + 1
+                jump_to_backup_index(filt[pos + 1], clear_filter=False)
+        elif st.session_state.backup_index is None:
             if st.session_state.cache_min is not None and st.session_state.backup_total:
                 # 起動時にプリロード済みのキャッシュをそのまま使う（API呼び出し不要）
                 apply_backup_index(st.session_state.backup_total)
@@ -413,20 +441,60 @@ def render_backup_nav_controls(key_prefix=""):
                 apply_backup_index(target)
         st.rerun()
 
-def jump_to_backup_index(target_idx):
+def jump_to_backup_index(target_idx, clear_filter=True):
     """
     指定した絶対インデックスへジャンプする。
     既にキャッシュ範囲内ならAPI呼び出しなしで即座に反映し、範囲外ならその周辺を取得する。
+    clear_filter=True の場合、リマインダー検索フィルターが有効なら解除する
+    （フィルター結果外へジャンプすると filter_pos との整合性が取れなくなるため。
+    検索結果内へのジャンプ時は呼び出し側で clear_filter=False を指定する）。
     """
     if st.session_state.backup_total is None or target_idx is None:
         st.warning("バックアップ履歴の総件数が不明です。先に「🔄 スプレッドシートを再読み込み」を押してください。")
         return
+    if clear_filter and st.session_state.backup_filter_indices is not None:
+        st.session_state.backup_filter_query = ""
+        st.session_state.backup_filter_indices = None
+        st.session_state.backup_filter_pos = None
     target_idx = max(1, min(st.session_state.backup_total, int(target_idx)))
     if st.session_state.cache_min is not None and st.session_state.cache_max is not None \
             and st.session_state.cache_min <= target_idx <= st.session_state.cache_max:
         apply_backup_index(target_idx)
     else:
         load_backup_window(center_idx=target_idx)
+
+def search_backups_by_reminder(search_text):
+    """
+    スプレッドシートの全バックアップ（B列のJSON）を走査し、reminder_text に
+    search_text を含むものだけの絶対インデックスを古い順に返す。
+    B列はJSONを含むためA列だけの軽量読み込みができず、全件取得が必要になる点に注意。
+    戻り値: [idx, idx, ...]（1件も無ければ空リスト） または None（取得失敗時）
+    """
+    if not search_text:
+        return None
+    gc = get_gspread_client()
+    if not gc:
+        return None
+    try:
+        sh = gc.open_by_url(FIXED_SHEET_URL)
+        ws = sh.get_worksheet(0)
+        ensure_header(ws)
+        all_values = ws.get_all_values()  # [[timestamp, json_str], ...]（ヘッダー込み）
+    except Exception:
+        return None
+
+    matched = []
+    for row_num, row in enumerate(all_values[1:], start=1):  # ヘッダーを除く。row_num=絶対インデックス
+        if len(row) < 2 or not row[1]:
+            continue
+        try:
+            data = json.loads(row[1])
+            reminder = data.get("reminder_text", "") or ""
+            if search_text in reminder:
+                matched.append(row_num)
+        except Exception:
+            continue
+    return matched
 
 def find_backup_index_by_date(target_date):
     """
@@ -549,6 +617,12 @@ if 'backup_index' not in st.session_state:
     st.session_state.backup_index = None    # 現在表示中の絶対インデックス（1=最古）
 if 'backup_total' not in st.session_state:
     st.session_state.backup_total = None
+if 'backup_filter_query' not in st.session_state:
+    st.session_state.backup_filter_query = ""       # 現在有効なリマインダー検索文字列（空="フィルター無効"）
+if 'backup_filter_indices' not in st.session_state:
+    st.session_state.backup_filter_indices = None    # フィルターに一致した絶対インデックスのリスト（古い順）
+if 'backup_filter_pos' not in st.session_state:
+    st.session_state.backup_filter_pos = None        # backup_filter_indices内での現在位置（0始まり）
 if 'startup_backup_preloaded' not in st.session_state:
     st.session_state.startup_backup_preloaded = False
 
@@ -1352,6 +1426,44 @@ with st.sidebar:
     # --- ジャンプ機能（件数が多くなっても目的のバックアップへ素早く到達できるようにする） ---
     render_backup_jump_controls(key_prefix="sidebar_")
 
+    # --- リマインダー内容での検索フィルター ---
+    st.markdown("**リマインダーで検索**")
+    search_col1, search_col2 = st.columns([2, 1])
+    search_query = search_col1.text_input(
+        "検索文字列", value="", key="sidebar_reminder_search_input",
+        label_visibility="collapsed", placeholder="例：決算"
+    )
+    if search_col2.button("検索", key="sidebar_reminder_search_btn", use_container_width=True):
+        if not search_query:
+            st.warning("検索文字列を入力してください")
+        else:
+            with st.spinner("スプレッドシートを検索中..."):
+                matched = search_backups_by_reminder(search_query)
+            if matched is None:
+                st.error("検索に失敗しました。Google連携の設定をご確認ください。")
+            elif not matched:
+                st.warning(f"「{search_query}」を含むバックアップは見つかりませんでした")
+                st.session_state.backup_filter_query = ""
+                st.session_state.backup_filter_indices = None
+                st.session_state.backup_filter_pos = None
+            else:
+                st.session_state.backup_filter_query = search_query
+                st.session_state.backup_filter_indices = matched
+                st.session_state.backup_filter_pos = len(matched) - 1  # 最新の一致から開始
+                jump_to_backup_index(matched[-1], clear_filter=False)
+                st.rerun()
+
+    if st.session_state.backup_filter_indices is not None:
+        n_matched = len(st.session_state.backup_filter_indices)
+        pos_disp = (st.session_state.backup_filter_pos + 1) if st.session_state.backup_filter_pos is not None else "-"
+        st.caption(f"🔍 フィルター中: 「{st.session_state.backup_filter_query}」（{pos_disp} / {n_matched}件）"
+                   "　「◀」「▶」はこの絞り込み結果内のみを移動します")
+        if st.button("✕ フィルター解除", key="sidebar_clear_filter_btn"):
+            st.session_state.backup_filter_query = ""
+            st.session_state.backup_filter_indices = None
+            st.session_state.backup_filter_pos = None
+            st.rerun()
+
     # --- 現在表示中のバックアップ情報を表示（保存No. / 保存日付） ---
     if st.session_state.backup_index is not None:
         entry = st.session_state.backup_cache.get(st.session_state.backup_index)
@@ -1648,6 +1760,11 @@ with col_quick_nav:
 if "_delete_success_msg" in st.session_state:
     st.success(st.session_state.pop("_delete_success_msg"))
 
+profit_display_mode = st.radio(
+    "各銘柄の損益表示", ["円", "％"], index=0, horizontal=True,
+    key="profit_display_mode", label_visibility="collapsed"
+)
+
 rows = []
 row_keys = []  # rows[i] に対応する実際の portfolio キー（削除対象の特定に使う）
 total_profit_jpy = 0
@@ -1676,10 +1793,12 @@ for i, (key, info) in enumerate(st.session_state.portfolio.items()):
 
     if shares == 0:
         p_jpy = 0
+        p_pct = 0
         label = "決済済"
     elif not price_available:
         # 価格が取得できない銘柄は損益0円として扱い、合計に影響を与えない
         p_jpy = 0
+        p_pct = 0
         label = "信用(売建)" if "_SHORT" in key else ("信用(買建)" if "_MARGIN_LONG" in key else "現物")
     else:
         # --- [修正版] 損益計算ロジック ---
@@ -1692,6 +1811,9 @@ for i, (key, info) in enumerate(st.session_state.portfolio.items()):
         else:
             label = "現物"
             diff = cur - info['cost']
+
+        # 損益率は通貨換算不要（同一通貨内の比率のため）
+        p_pct = (diff / info['cost'] * 100) if info['cost'] else 0
 
         if info.get('currency') == "USD":
             p_usd = diff * shares
@@ -1718,11 +1840,12 @@ for i, (key, info) in enumerate(st.session_state.portfolio.items()):
         display_label += "（未反映）"
 
     row_keys.append(key)
+    profit_col_label = "損益(％)" if st.session_state.get("profit_display_mode") == "％" else "損益(円)"
     rows.append({
         "選択": False,
         "No.": i + 1, "銘柄": display_name, "数量": shares, "区分": display_label,
         "取得単価": cost_display, "現在値 (前日比)": cur_display,
-        "損益(円)": p_jpy if (shares == 0 or price_available) else 0
+        profit_col_label: p_pct if profit_col_label == "損益(％)" else (p_jpy if (shares == 0 or price_available) else 0)
     })
 
 m_col1, m_col2 = st.columns(2)
@@ -1738,16 +1861,22 @@ m_col2.metric("米国株合計損益 (USD)", f"${total_profit_usd_only_us_stocks
 
 if rows:
     df_display = pd.DataFrame(rows)
+    profit_col_name = "損益(％)" if profit_display_mode == "％" else "損益(円)"
+    profit_col_config = (
+        st.column_config.NumberColumn(profit_col_name, format="%+.2f%%")
+        if profit_display_mode == "％"
+        else st.column_config.NumberColumn(profit_col_name, format="¥%,.0f")
+    )
     edited_df = st.data_editor(
         df_display,
         column_config={
             "選択": st.column_config.CheckboxColumn("選択", default=False, width="small"),
-            "損益(円)": st.column_config.NumberColumn("損益(円)", format="¥%,.0f"),
+            profit_col_name: profit_col_config,
         },
-        disabled=["No.", "銘柄", "数量", "区分", "取得単価", "現在値 (前日比)", "損益(円)"],
+        disabled=["No.", "銘柄", "数量", "区分", "取得単価", "現在値 (前日比)", profit_col_name],
         hide_index=True,
         use_container_width=True,
-        key="portfolio_table_editor"
+        key=f"portfolio_table_editor_{profit_display_mode}"
     )
     selected_keys = [row_keys[idx] for idx, checked in enumerate(edited_df["選択"]) if checked]
 
