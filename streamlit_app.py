@@ -1435,7 +1435,11 @@ with st.sidebar:
     )
     if search_col2.button("検索", key="sidebar_reminder_search_btn", use_container_width=True):
         if not search_query:
-            st.warning("検索文字列を入力してください")
+            # 検索文字列が空の場合はフィルターを解除し、全行を対象にする
+            st.session_state.backup_filter_query = ""
+            st.session_state.backup_filter_indices = None
+            st.session_state.backup_filter_pos = None
+            st.success("フィルターを解除しました（全件を対象にします）")
         else:
             with st.spinner("スプレッドシートを検索中..."):
                 matched = search_backups_by_reminder(search_query)
