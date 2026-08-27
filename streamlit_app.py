@@ -512,6 +512,82 @@ def search_backups_by_reminder(search_text, exclude_text=""):
         matched.append(row_num)
     return matched
 
+def calculate_snapshot_profit_jpy(portfolio_dict, prices_dict, rate):
+    """
+    1つのバックアップ（保有銘柄の辞書）について、現在の株価をもとにした
+    合計損益（円換算）を計算する。価格が取得できない銘柄は0円として扱う
+    （メイン画面の総合計損益と同じ考え方）。
+    """
+    total = 0.0
+    for key, info in portfolio_dict.items():
+        shares = info.get('shares', 0)
+        if not shares:
+            continue
+        p_data = prices_dict.get(key)
+        cur = p_data.get('current') if p_data else None
+        if cur is None or (isinstance(cur, float) and pd.isna(cur)):
+            continue
+        cost = info.get('cost', 0)
+        if "_SHORT" in key:
+            diff = cost - cur
+        else:
+            diff = cur - cost
+        if info.get('currency') == "USD":
+            total += diff * shares * rate
+        else:
+            total += diff * shares
+    return total
+
+def aggregate_backups_profit(indices, td_api_key=None):
+    """
+    指定したバックアップ（絶対インデックスのリスト）それぞれについて、
+    保有銘柄の現在株価をもとにした損益（円換算）を計算し、その合計を返す。
+    ※ 過去の株価は保存していないため、常に「今の価格」で評価する。
+    対象全体に登場する銘柄をまとめて1回だけ価格取得することで、重複取得を避ける。
+    戻り値: (grand_total_jpy, 集計に含めたバックアップ件数) または (None, 0)（取得失敗時）
+    """
+    if not indices:
+        return 0.0, 0
+
+    gc = get_gspread_client()
+    if not gc:
+        return None, 0
+    try:
+        sh = gc.open_by_url(FIXED_SHEET_URL)
+        ws = sh.get_worksheet(0)
+        ensure_header(ws)
+        all_values = ws.get_all_values()  # [[timestamp, json_str], ...]（ヘッダー込み）
+    except Exception:
+        return None, 0
+
+    index_set = set(indices)
+    snapshots = []  # [(idx, portfolio_dict), ...]
+    all_keys = set()
+    for row_num, row in enumerate(all_values[1:], start=1):
+        if row_num not in index_set:
+            continue
+        if len(row) < 2 or not row[1]:
+            continue
+        try:
+            data = json.loads(row[1])
+            portfolio_dict = data.get("portfolio", {}) or {}
+        except Exception:
+            continue
+        snapshots.append((row_num, portfolio_dict))
+        all_keys.update(portfolio_dict.keys())
+
+    if not snapshots:
+        return 0.0, 0
+
+    prices_dict, _ = get_prices_with_cache(all_keys, td_api_key=td_api_key)
+    rate = prices_dict.get("USDJPY", 159.2)
+
+    grand_total = 0.0
+    for _, portfolio_dict in snapshots:
+        grand_total += calculate_snapshot_profit_jpy(portfolio_dict, prices_dict, rate)
+
+    return grand_total, len(snapshots)
+
 def find_backup_index_by_date(target_date):
     """
     スプレッドシートのA列（タイムスタンプ）だけを読み、target_date（日付のみ、時刻は無視）に
@@ -1520,6 +1596,41 @@ with st.sidebar:
                     f"📅 保存日付: **{display_ts}**")
     else:
         st.caption("バックアップ履歴はまだ読み込まれていません（「◀ 1つ前の設定」を押すと表示されます）")
+
+    # --- 損益集計（全シート、またはリマインダー検索でフィルター中ならその抽出結果のみ対象） ---
+    if st.button("📊 損益集計", key="sidebar_aggregate_profit_btn"):
+        if st.session_state.backup_filter_indices is not None:
+            target_indices = st.session_state.backup_filter_indices
+            scope_desc = f"フィルター中の{len(target_indices)}件"
+        else:
+            if st.session_state.backup_total is None:
+                load_backup_window(initial=True)
+            total_n = st.session_state.backup_total or 0
+            target_indices = list(range(1, total_n + 1))
+            scope_desc = f"全{len(target_indices)}件"
+
+        with st.spinner(f"{scope_desc}を集計中..."):
+            grand_total, included = aggregate_backups_profit(target_indices, td_api_key=current_twelvedata_key)
+
+        if grand_total is None:
+            st.session_state["_aggregate_profit_result"] = None
+            st.error("集計に失敗しました。Google連携の設定をご確認ください。")
+        else:
+            st.session_state["_aggregate_profit_result"] = grand_total
+            st.session_state["_aggregate_profit_count"] = included
+            st.session_state["_aggregate_profit_scope"] = scope_desc
+
+    if st.session_state.get("_aggregate_profit_result") is not None:
+        total_val = st.session_state["_aggregate_profit_result"]
+        count_val = st.session_state.get("_aggregate_profit_count", 0)
+        scope_val = st.session_state.get("_aggregate_profit_scope", "")
+        st.markdown(f"""
+        <div style="background-color:rgba(28,131,225,0.1); border:1px solid rgba(28,131,225,0.4);
+                    border-radius:8px; padding:10px 14px; text-align:center;">
+            <div style="font-size:0.85em; color:#aaa;">損益額（円換算・{scope_val} / {count_val}件を集計）</div>
+            <div style="font-size:1.4em; font-weight:bold;">¥{total_val:,.0f}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.divider()
     st.header("📄 CSV読み込み")
