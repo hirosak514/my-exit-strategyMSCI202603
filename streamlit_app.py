@@ -454,6 +454,7 @@ def jump_to_backup_index(target_idx, clear_filter=True):
         return
     if clear_filter and st.session_state.backup_filter_indices is not None:
         st.session_state.backup_filter_query = ""
+        st.session_state.backup_filter_exclude = ""
         st.session_state.backup_filter_indices = None
         st.session_state.backup_filter_pos = None
     target_idx = max(1, min(st.session_state.backup_total, int(target_idx)))
@@ -463,15 +464,27 @@ def jump_to_backup_index(target_idx, clear_filter=True):
     else:
         load_backup_window(center_idx=target_idx)
 
-def search_backups_by_reminder(search_text):
+def _split_search_terms(text):
+    """全角/半角スペース両方をセパレータとしてキーワードを分割し、空要素を除いて返す"""
+    if not text:
+        return []
+    terms = re.split(r'[ \u3000]+', text.strip())
+    return [t for t in terms if t]
+
+def search_backups_by_reminder(search_text, exclude_text=""):
     """
-    スプレッドシートの全バックアップ（B列のJSON）を走査し、reminder_text に
-    search_text を含むものだけの絶対インデックスを古い順に返す。
+    スプレッドシートの全バックアップ（B列のJSON）を走査し、reminder_text が条件に合うものだけの
+    絶対インデックスを古い順に返す。
+    - search_text: 半角/全角スペース区切りの複数キーワード。すべて含む（AND）ものだけを対象にする。
+      空文字列なら絞り込みなし（全件が対象）。
+    - exclude_text: 半角/全角スペース区切りの複数キーワード。1つでも含む（OR）ものは除外する。
+      空文字列なら除外を行わない。
     B列はJSONを含むためA列だけの軽量読み込みができず、全件取得が必要になる点に注意。
     戻り値: [idx, idx, ...]（1件も無ければ空リスト） または None（取得失敗時）
     """
-    if not search_text:
-        return None
+    include_terms = _split_search_terms(search_text)
+    exclude_terms = _split_search_terms(exclude_text)
+
     gc = get_gspread_client()
     if not gc:
         return None
@@ -490,10 +503,13 @@ def search_backups_by_reminder(search_text):
         try:
             data = json.loads(row[1])
             reminder = data.get("reminder_text", "") or ""
-            if search_text in reminder:
-                matched.append(row_num)
         except Exception:
             continue
+        if include_terms and not all(term in reminder for term in include_terms):
+            continue
+        if exclude_terms and any(term in reminder for term in exclude_terms):
+            continue
+        matched.append(row_num)
     return matched
 
 def find_backup_index_by_date(target_date):
@@ -619,6 +635,8 @@ if 'backup_total' not in st.session_state:
     st.session_state.backup_total = None
 if 'backup_filter_query' not in st.session_state:
     st.session_state.backup_filter_query = ""       # 現在有効なリマインダー検索文字列（空="フィルター無効"）
+if 'backup_filter_exclude' not in st.session_state:
+    st.session_state.backup_filter_exclude = ""      # 現在有効な除外ワード文字列
 if 'backup_filter_indices' not in st.session_state:
     st.session_state.backup_filter_indices = None    # フィルターに一致した絶対インデックスのリスト（古い順）
 if 'backup_filter_pos' not in st.session_state:
@@ -1431,27 +1449,40 @@ with st.sidebar:
     search_col1, search_col2 = st.columns([2, 1])
     search_query = search_col1.text_input(
         "検索文字列", value="", key="sidebar_reminder_search_input",
-        label_visibility="collapsed", placeholder="例：決算"
+        label_visibility="collapsed", placeholder="例：決算 米国（スペース区切りでAND検索）"
+    )
+    exclude_query = st.text_input(
+        "除外ワード", value="", key="sidebar_reminder_exclude_input",
+        placeholder="例：延期 中止（スペース区切りで、いずれかを含むものを除外）"
     )
     if search_col2.button("検索", key="sidebar_reminder_search_btn", use_container_width=True):
-        if not search_query:
-            # 検索文字列が空の場合はフィルターを解除し、全行を対象にする
+        include_terms = _split_search_terms(search_query)
+        exclude_terms = _split_search_terms(exclude_query)
+        if not include_terms and not exclude_terms:
+            # 検索文字列・除外ワードともに空の場合はフィルターを解除し、全行を対象にする
             st.session_state.backup_filter_query = ""
+            st.session_state.backup_filter_exclude = ""
             st.session_state.backup_filter_indices = None
             st.session_state.backup_filter_pos = None
             st.success("フィルターを解除しました（全件を対象にします）")
         else:
             with st.spinner("スプレッドシートを検索中..."):
-                matched = search_backups_by_reminder(search_query)
+                matched = search_backups_by_reminder(search_query, exclude_query)
+            cond_disp = "、".join(filter(None, [
+                ("含む: " + " AND ".join(include_terms)) if include_terms else "",
+                ("除外: " + " OR ".join(exclude_terms)) if exclude_terms else "",
+            ]))
             if matched is None:
                 st.error("検索に失敗しました。Google連携の設定をご確認ください。")
             elif not matched:
-                st.warning(f"「{search_query}」を含むバックアップは見つかりませんでした")
+                st.warning(f"「{cond_disp}」に一致するバックアップは見つかりませんでした")
                 st.session_state.backup_filter_query = ""
+                st.session_state.backup_filter_exclude = ""
                 st.session_state.backup_filter_indices = None
                 st.session_state.backup_filter_pos = None
             else:
                 st.session_state.backup_filter_query = search_query
+                st.session_state.backup_filter_exclude = exclude_query
                 st.session_state.backup_filter_indices = matched
                 st.session_state.backup_filter_pos = len(matched) - 1  # 最新の一致から開始
                 jump_to_backup_index(matched[-1], clear_filter=False)
@@ -1460,10 +1491,17 @@ with st.sidebar:
     if st.session_state.backup_filter_indices is not None:
         n_matched = len(st.session_state.backup_filter_indices)
         pos_disp = (st.session_state.backup_filter_pos + 1) if st.session_state.backup_filter_pos is not None else "-"
-        st.caption(f"🔍 フィルター中: 「{st.session_state.backup_filter_query}」（{pos_disp} / {n_matched}件）"
+        filter_desc_parts = []
+        if st.session_state.backup_filter_query:
+            filter_desc_parts.append(f"含む「{st.session_state.backup_filter_query}」")
+        if st.session_state.get("backup_filter_exclude"):
+            filter_desc_parts.append(f"除外「{st.session_state.backup_filter_exclude}」")
+        filter_desc = " / ".join(filter_desc_parts) if filter_desc_parts else "（条件なし）"
+        st.caption(f"🔍 フィルター中: {filter_desc}（{pos_disp} / {n_matched}件）"
                    "　「◀」「▶」はこの絞り込み結果内のみを移動します")
         if st.button("✕ フィルター解除", key="sidebar_clear_filter_btn"):
             st.session_state.backup_filter_query = ""
+            st.session_state.backup_filter_exclude = ""
             st.session_state.backup_filter_indices = None
             st.session_state.backup_filter_pos = None
             st.rerun()
