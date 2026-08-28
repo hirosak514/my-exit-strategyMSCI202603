@@ -2001,7 +2001,8 @@ for i, (key, info) in enumerate(st.session_state.portfolio.items()):
         profit_col_label: p_pct if profit_col_label == "損益(％)" else (p_jpy if (shares == 0 or price_available) else 0)
     })
 
-m_col1, m_col2 = st.columns(2)
+m_col0, m_col1, m_col2 = st.columns([1, 2, 1])
+m_col0.metric("投資金額 (JPY)", f"¥{total_cost_basis_jpy:,.0f}")
 with m_col1:
     sub_amount, sub_pct = st.columns([2, 1])
     sub_amount.metric("総合計損益 (JPY)", f"¥{total_profit_jpy:,.0f}", delta=f"USD/JPY: {rate:.2f}")
