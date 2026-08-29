@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DB_FILE = "portfolio.json"
 EVENT_FILE = "events.json"
 REMINDER_FILE = "reminder.json"
+SETTLED_FILE = "settled_prices.json"
 CONFIG_FILE = "config.json"
 
 def now_jst():
@@ -351,6 +352,7 @@ def apply_backup_index(idx):
     st.session_state.portfolio = data.get("portfolio", {})
     st.session_state.events = data.get("events", [])
     st.session_state.reminder_text = data.get("reminder_text", "")
+    st.session_state.settled_prices = data.get("settled_prices", {})
     st.session_state.backup_index = idx
 
 def render_backup_nav_controls(key_prefix=""):
@@ -694,6 +696,8 @@ if 'events' not in st.session_state:
     st.session_state.events = load_json(EVENT_FILE, [])
 if 'reminder_text' not in st.session_state:
     st.session_state.reminder_text = load_json(REMINDER_FILE, "- ターゲット日程を入力してください")
+if 'settled_prices' not in st.session_state:
+    st.session_state.settled_prices = load_json(SETTLED_FILE, {})  # {銘柄キー: 決済時価格}
 if 'api_key' not in st.session_state:
     st.session_state.api_key = load_json(CONFIG_FILE, {"gemini_key": ""}).get("gemini_key", "")
 if 'twelvedata_key' not in st.session_state:
@@ -1468,14 +1472,83 @@ with st.sidebar:
     st.divider()
     st.header("📋 Reminder Edit")
     new_reminder = st.text_area("リマインダー内容", value=st.session_state.reminder_text)
-    if st.button("リマインダー更新"):
+
+    reminder_btn_col1, reminder_btn_col2 = st.columns(2)
+    if reminder_btn_col1.button("リマインダー更新"):
         st.session_state.reminder_text = new_reminder
         save_json(REMINDER_FILE, new_reminder)
         st.rerun()
 
+    @st.dialog("確認")
+    def confirm_settle_dialog():
+        st.write("決済済みにしますか？")
+        col_yes, col_no = st.columns(2)
+        if col_yes.button("はい", use_container_width=True):
+            # 1. リマインダーの文字列の最後に「決済済み」を追記
+            base_text = st.session_state.reminder_text or ""
+            if "決済済み" not in base_text:
+                sep = "\n" if base_text and not base_text.endswith("\n") else ""
+                updated_reminder = f"{base_text}{sep}決済済み"
+            else:
+                updated_reminder = base_text
+            st.session_state.reminder_text = updated_reminder
+            save_json(REMINDER_FILE, updated_reminder)
+
+            # 2. 現在取得済みの価格を「決済時価格」として記録する
+            #    （サイドバーはメイン画面より先に描画されるため、ここで改めて取得する。
+            #    既に取得済みの銘柄はキャッシュされているので追加コストは小さい）
+            settle_prices_dict, _ = get_prices_with_cache(
+                st.session_state.portfolio.keys(), td_api_key=current_twelvedata_key
+            )
+            new_settled = {}
+            for pkey in st.session_state.portfolio.keys():
+                p_data = settle_prices_dict.get(pkey)
+                cur = p_data.get('current') if p_data else None
+                if cur is not None and not (isinstance(cur, float) and pd.isna(cur)):
+                    new_settled[pkey] = float(cur)
+            st.session_state.settled_prices = new_settled
+            save_json(SETTLED_FILE, new_settled)
+
+            # 3. 現在表示中のバックアップがあれば、スプレッドシート側も上書きして記録する
+            #    （既に決済時価格が記録済みの場合もこれで更新される）
+            if st.session_state.backup_index is not None:
+                data_to_write = {
+                    "portfolio": st.session_state.portfolio,
+                    "events": st.session_state.events,
+                    "reminder_text": updated_reminder,
+                    "settled_prices": new_settled,
+                }
+                written_ts = overwrite_backup_at_index(st.session_state.backup_index, data_to_write)
+                if written_ts:
+                    entry = st.session_state.backup_cache.get(st.session_state.backup_index)
+                    if entry:
+                        entry["data"] = data_to_write
+                    st.session_state["_settle_success_msg"] = "決済済みにし、スプレッドシートへ記録しました"
+                else:
+                    st.session_state["_settle_success_msg"] = "決済済みにしましたが、スプレッドシートへの記録に失敗しました"
+            else:
+                st.session_state["_settle_success_msg"] = (
+                    "決済済みにしました（現在バックアップを閲覧していないため、"
+                    "スプレッドシートへの記録はスキップしました）"
+                )
+            st.rerun()
+        if col_no.button("いいえ", use_container_width=True):
+            st.rerun()
+
+    if reminder_btn_col2.button("決済済"):
+        confirm_settle_dialog()
+
+    if "_settle_success_msg" in st.session_state:
+        st.success(st.session_state.pop("_settle_success_msg"))
+
     st.markdown('<hr style="margin: 0.5rem 0;">', unsafe_allow_html=True)
     st.subheader("💾 Backup (Spreadsheet)")
-    full_config = {"portfolio": st.session_state.portfolio, "events": st.session_state.events, "reminder_text": st.session_state.reminder_text}
+    full_config = {
+        "portfolio": st.session_state.portfolio,
+        "events": st.session_state.events,
+        "reminder_text": st.session_state.reminder_text,
+        "settled_prices": st.session_state.settled_prices,
+    }
 
     @st.dialog("確認")
     def confirm_overwrite_dialog(data_to_write, target_idx):
@@ -1918,6 +1991,15 @@ profit_display_mode = st.radio(
     key="profit_display_mode", label_visibility="collapsed"
 )
 
+# --- 決済済みリマインダー + 決済時価格が記録されている場合のみ、価格の一時切替トグルを表示 ---
+is_settled_view = "決済済み" in (st.session_state.reminder_text or "") and bool(st.session_state.settled_prices)
+show_live_price_temporarily = False
+if is_settled_view:
+    show_live_price_temporarily = st.toggle(
+        "🔓 最新価格を一時表示する（OFFの間は決済時価格に固定して表示）",
+        value=False, key="show_live_price_toggle"
+    )
+
 rows = []
 row_keys = []  # rows[i] に対応する実際の portfolio キー（削除対象の特定に使う）
 total_profit_jpy = 0
@@ -1935,13 +2017,21 @@ for i, (key, info) in enumerate(st.session_state.portfolio.items()):
     # --- 価格取得の成否を判定（NaN・取得失敗の両方をここで吸収する） ---
     cur, prev = None, None
     price_available = False
-    if p_data:
+    is_using_settled_price = False
+    if is_settled_view and not show_live_price_temporarily and key in st.session_state.settled_prices:
+        # 決済済み表示モード（トグルOFF）中は、記録済みの決済時価格に固定する
+        cur = st.session_state.settled_prices[key]
+        price_available = True
+        is_using_settled_price = True
+    elif p_data:
         cur, prev = p_data.get("current"), p_data.get("prev_close")
         if cur is not None and not pd.isna(cur):
             price_available = True
 
     day_change_pct = ""
-    if price_available and prev is not None and not pd.isna(prev) and prev != 0:
+    if is_using_settled_price:
+        day_change_pct = "(決済値)"
+    elif price_available and prev is not None and not pd.isna(prev) and prev != 0:
         day_change_pct = f"({(cur - prev) / prev * 100:+.2f}%)"
 
     if shares == 0:
@@ -2073,6 +2163,7 @@ def confirm_delete_sheet_dialog(target_idx):
             st.session_state.portfolio = load_json(DB_FILE, {})
             st.session_state.events = load_json(EVENT_FILE, [])
             st.session_state.reminder_text = load_json(REMINDER_FILE, "- ターゲット日程を入力してください")
+            st.session_state.settled_prices = load_json(SETTLED_FILE, {})
             st.session_state.backup_cache = {}
             st.session_state.cache_min = None
             st.session_state.cache_max = None
