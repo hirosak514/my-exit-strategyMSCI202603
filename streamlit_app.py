@@ -1069,8 +1069,10 @@ def _fetch_single_symbol_price(key, td_api_key):
     ticker = f"{symbol}.T" if is_japan else ("7013.T" if symbol == "IHI" else symbol)
     error_msg = ""
 
-    # --- 0. Twelve Data（設定されている場合のみ） ---
-    if td_api_key:
+    # --- 0. Twelve Data（設定されている場合のみ。ただし日本株はスキップする） ---
+    # Twelve Dataの無料プランは東証（TSE/JPX）データを提供していないことが判明したため、
+    # 日本株については無駄な問い合わせをせず最初からYahoo Financeルートへ進む。
+    if td_api_key and not is_japan:
         try:
             td_result, td_debug = fetch_twelvedata_quotes([key], td_api_key)
             if key in td_result:
@@ -1198,14 +1200,24 @@ def _fetch_usdjpy_rate(td_api_key):
 
 PRICE_CACHE_TTL_SECONDS = 900  # 15分
 
+class PriceFetchFailed(Exception):
+    """価格取得に失敗したことを示す例外。st.cache_dataは例外発生時の結果をキャッシュしないため、
+    これを使うことで「失敗結果」がTTL満了まで15分間ずっと固定されてしまう問題を避けられる
+    （一時的なレート制限が数十秒で解けても、次回のrerunですぐ再試行できるようにするため）。"""
+    pass
+
 @st.cache_data(ttl=PRICE_CACHE_TTL_SECONDS, show_spinner=False)
 def _fetch_single_symbol_price_cached(key, td_api_key):
     """
     銘柄1つ単位で価格をキャッシュする。
     バックアップ履歴を移動して保有銘柄構成が変わっても、共通する銘柄はこのキャッシュを
     使い回せるため、銘柄セット全体をキーにしていた以前の方式より無駄な再取得が大幅に減る。
+    取得に失敗した場合は例外を投げ、失敗結果自体はキャッシュしない。
     """
-    return _fetch_single_symbol_price(key, td_api_key)
+    result, debug_msg, error_msg = _fetch_single_symbol_price(key, td_api_key)
+    if result is None:
+        raise PriceFetchFailed(error_msg or "価格取得に失敗しました")
+    return result, debug_msg, error_msg
 
 @st.cache_data(ttl=PRICE_CACHE_TTL_SECONDS, show_spinner=False)
 def _fetch_usdjpy_rate_cached(td_api_key):
@@ -1238,6 +1250,8 @@ def get_live_prices(portfolio_keys, td_api_key=None):
                 key = future_to_key[future]
                 try:
                     result, debug_msg, error_msg = future.result()
+                except PriceFetchFailed as e:
+                    result, debug_msg, error_msg = None, "", str(e)
                 except Exception as e:
                     result, debug_msg, error_msg = None, "", f"{type(e).__name__}: {e}"
                 prices[key] = result
