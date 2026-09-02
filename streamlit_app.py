@@ -1019,6 +1019,11 @@ def fetch_twelvedata_quotes(portfolio_keys, api_key):
 
     return results
 
+def _is_rate_limit_error(e):
+    """Yahoo側のレート制限エラーかどうかを判定する（例外の型名・メッセージの両方を見る）"""
+    msg = f"{type(e).__name__} {e}".lower()
+    return "ratelimit" in msg or "too many requests" in msg
+
 def _fetch_single_symbol_price(key, td_api_key):
     """
     1銘柄分の価格を、優先順位（Twelve Data → .info → metadata → fast_info → history）で取得する。
@@ -1046,6 +1051,7 @@ def _fetch_single_symbol_price(key, td_api_key):
     got_price = False
     result = None
     debug_msg = ""
+    rate_limited = False  # 一度検知したら、同じYahoo側API/IPブロックへの無駄な再試行を打ち切る
 
     # --- 1. .info（v7/finance/quote エンドポイント）を最優先で試す ---
     # (get_history_metadata / fast_info / history は、実は全て同じ「チャート用API」を
@@ -1068,9 +1074,11 @@ def _fetch_single_symbol_price(key, td_api_key):
             got_price = True
     except Exception as e:
         error_msg += f" / [info] {type(e).__name__}: {e}"
+        if _is_rate_limit_error(e):
+            rate_limited = True
 
     # --- 2. .info が使えない場合は get_history_metadata() の regularMarketPrice を試す ---
-    if not got_price:
+    if not got_price and not rate_limited:
         try:
             stock = yf.Ticker(ticker)
             md = stock.get_history_metadata()
@@ -1084,8 +1092,10 @@ def _fetch_single_symbol_price(key, td_api_key):
                 got_price = True
         except Exception as e:
             error_msg += f" / [metadata] {type(e).__name__}: {e}"
+            if _is_rate_limit_error(e):
+                rate_limited = True
 
-    if not got_price:
+    if not got_price and not rate_limited:
         # --- 3. metadataも使えない場合は fast_info を試す ---
         try:
             stock = yf.Ticker(ticker)
@@ -1098,8 +1108,10 @@ def _fetch_single_symbol_price(key, td_api_key):
                 got_price = True
         except Exception as e:
             error_msg += f" / [fast_info] {type(e).__name__}: {e}"
+            if _is_rate_limit_error(e):
+                rate_limited = True
 
-    if not got_price:
+    if not got_price and not rate_limited:
         # --- 4. それでもダメなら従来の日足取得にフォールバック ---
         try:
             stock = yf.Ticker(ticker)
@@ -1117,6 +1129,11 @@ def _fetch_single_symbol_price(key, td_api_key):
                 error_msg += " / 空のデータが返されました（レート制限の可能性）"
         except Exception as e:
             error_msg += f" / [history] {type(e).__name__}: {e}"
+            if _is_rate_limit_error(e):
+                rate_limited = True
+
+    if rate_limited and not got_price:
+        error_msg = "[Yahoo] レート制限中のため以降のフォールバックはスキップしました / " + error_msg.strip(" /")
 
     time.sleep(0.3)  # 実際にネットワークへ取りに行った場合のみ待機（レート制限対策）
     return result, debug_msg, error_msg.strip(" /")
@@ -1166,14 +1183,21 @@ def get_live_prices(portfolio_keys, td_api_key=None):
     portfolio_keys = list(portfolio_keys)
 
     if portfolio_keys:
-        # 銘柄ごとの取得はネットワークI/O待ちが支配的なので、並列化して大幅に高速化する。
-        # （st.cache_dataでヒットする銘柄は即座に返るが、未キャッシュの銘柄が多いバックアップに
-        #  切り替えた際、逐次処理だと銘柄数×待機時間の分だけ直列に遅くなっていたため）
-        max_workers = min(8, len(portfolio_keys))
+        # 銘柄ごとの取得はネットワークI/O待ちが支配的なので、並列化して高速化する。
+        # ただし並列度が高すぎるとYahoo側のレート制限（Too Many Requests）を誘発するため、
+        # 並列数を抑えつつ、各リクエストの開始タイミングを少しずつずらして
+        # 瞬間的なバーストアクセスを避ける。
+        max_workers = min(4, len(portfolio_keys))
+
+        def _fetch_with_jitter(key, delay):
+            if delay:
+                time.sleep(delay)
+            return _fetch_single_symbol_price_cached(key, td_api_key)
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_key = {
-                executor.submit(_fetch_single_symbol_price_cached, key, td_api_key): key
-                for key in portfolio_keys
+                executor.submit(_fetch_with_jitter, key, (i % max_workers) * 0.15): key
+                for i, key in enumerate(portfolio_keys)
             }
             for future in as_completed(future_to_key):
                 key = future_to_key[future]
@@ -1471,11 +1495,19 @@ with st.sidebar:
 
     st.divider()
     st.header("📋 Reminder Edit")
-    new_reminder = st.text_area("リマインダー内容", value=st.session_state.reminder_text)
+
+    # reminder_text（正データ）が外部（決済済ボタン等）から更新された場合、
+    # テキストエリアのウィジェット側にも確実に反映されるよう明示的に同期する
+    if st.session_state.get('_reminder_widget_sync_token') != st.session_state.reminder_text:
+        st.session_state.reminder_text_widget = st.session_state.reminder_text
+        st.session_state['_reminder_widget_sync_token'] = st.session_state.reminder_text
+
+    new_reminder = st.text_area("リマインダー内容", key="reminder_text_widget")
 
     reminder_btn_col1, reminder_btn_col2 = st.columns(2)
     if reminder_btn_col1.button("リマインダー更新"):
         st.session_state.reminder_text = new_reminder
+        st.session_state['_reminder_widget_sync_token'] = new_reminder
         save_json(REMINDER_FILE, new_reminder)
         st.rerun()
 
