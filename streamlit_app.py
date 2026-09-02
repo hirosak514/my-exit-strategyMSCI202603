@@ -958,11 +958,13 @@ def build_twelvedata_symbol(portfolio_key):
 def fetch_twelvedata_quotes(portfolio_keys, api_key):
     """
     Twelve Data の /quote エンドポイントで複数銘柄をまとめて取得する。
-    戻り値: {portfolio_key: {"current":..., "prev_close":...}} （取得できたものだけを含む）
-    取得できなかった銘柄はこの戻り値に含まれないので、呼び出し元でYahooにフォールバックする。
+    戻り値: (results, debug_info)
+    - results: {portfolio_key: {"current":..., "prev_close":...}} （取得できたものだけを含む）
+    - debug_info: {portfolio_key: 診断メッセージ}（成功・失敗いずれも記録し、
+      呼び出し元でYahooにフォールバックした際も「なぜTwelve Dataがダメだったか」を追跡できるようにする）
     """
     if not api_key or not portfolio_keys:
-        return {}
+        return {}, {}
 
     key_to_symbol = {k: build_twelvedata_symbol(k) for k in portfolio_keys}
     symbol_to_keys = {}
@@ -971,6 +973,7 @@ def fetch_twelvedata_quotes(portfolio_keys, api_key):
 
     symbols = list(symbol_to_keys.keys())
     results = {}
+    debug_info = {}
 
     CHUNK = 100  # Twelve Dataは1リクエストあたり最大120銘柄まで対応（余裕を持たせる）
     for i in range(0, len(symbols), CHUNK):
@@ -979,8 +982,11 @@ def fetch_twelvedata_quotes(portfolio_keys, api_key):
         try:
             resp = requests.get(f"{TWELVEDATA_BASE_URL}/quote", params=params, timeout=10)
             data = resp.json()
-        except Exception:
-            continue  # このチャンクは全滅 → 呼び出し元でYahooにフォールバックされる
+        except Exception as e:
+            for sym in chunk_symbols:
+                for k in symbol_to_keys.get(sym, []):
+                    debug_info[k] = f"通信エラー: {type(e).__name__}: {e}"
+            continue
 
         # 単一銘柄の場合は結果がそのままdictで返り、複数銘柄の場合はsymbolをキーにしたdict of dictで返る
         if isinstance(data, dict) and "symbol" in data:
@@ -988,23 +994,14 @@ def fetch_twelvedata_quotes(portfolio_keys, api_key):
         elif isinstance(data, dict):
             entries = data
         else:
-            entries = {}
+            for sym in chunk_symbols:
+                for k in symbol_to_keys.get(sym, []):
+                    debug_info[k] = f"予期しない応答形式: {str(data)[:200]}"
+            continue
 
+        seen_symbols = set()
         for sym, entry in entries.items():
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("status") == "error" or "close" not in entry:
-                continue
-            try:
-                cur = float(entry["close"])
-            except (TypeError, ValueError):
-                continue
-            prev = entry.get("previous_close")
-            try:
-                prev = float(prev) if prev is not None else None
-            except (TypeError, ValueError):
-                prev = None
-
+            seen_symbols.add(sym)
             matched_keys = symbol_to_keys.get(sym)
             if not matched_keys:
                 # レスポンスのsymbol表記が微妙に異なる場合（例: "7203:TSE" vs "7203"）への保険
@@ -1013,11 +1010,46 @@ def fetch_twelvedata_quotes(portfolio_keys, api_key):
                     if cand_sym.split(':')[0] == base:
                         matched_keys = ks
                         break
-            if matched_keys:
-                for k in matched_keys:
-                    results[k] = {"current": cur, "prev_close": prev}
+            if not matched_keys:
+                continue  # 内部キーに対応付けられない想定外のsymbol
 
-    return results
+            if not isinstance(entry, dict):
+                for k in matched_keys:
+                    debug_info[k] = f"予期しない形式のエントリ: {str(entry)[:200]}"
+                continue
+            if entry.get("status") == "error":
+                err_msg = entry.get("message", "不明なエラー")
+                for k in matched_keys:
+                    debug_info[k] = f"APIエラー: {err_msg}"
+                continue
+            if "close" not in entry:
+                for k in matched_keys:
+                    debug_info[k] = f"'close'フィールドが応答に含まれていません: {list(entry.keys())}"
+                continue
+            try:
+                cur = float(entry["close"])
+            except (TypeError, ValueError):
+                for k in matched_keys:
+                    debug_info[k] = f"'close'の値が数値に変換できません: {entry.get('close')}"
+                continue
+            prev = entry.get("previous_close")
+            try:
+                prev = float(prev) if prev is not None else None
+            except (TypeError, ValueError):
+                prev = None
+
+            for k in matched_keys:
+                results[k] = {"current": cur, "prev_close": prev}
+                debug_info[k] = f"成功: 現在値={cur} 前日終値={prev}"
+
+        # リクエストしたのに応答に一切現れなかった銘柄も記録しておく
+        for sym in chunk_symbols:
+            if sym not in seen_symbols:
+                for k in symbol_to_keys.get(sym, []):
+                    if k not in debug_info:
+                        debug_info[k] = "応答に含まれていませんでした（未対応の銘柄・取引所の可能性）"
+
+    return results, debug_info
 
 def _is_rate_limit_error(e):
     """Yahoo側のレート制限エラーかどうかを判定する（例外の型名・メッセージの両方を見る）"""
@@ -1040,11 +1072,14 @@ def _fetch_single_symbol_price(key, td_api_key):
     # --- 0. Twelve Data（設定されている場合のみ） ---
     if td_api_key:
         try:
-            td_result = fetch_twelvedata_quotes([key], td_api_key)
+            td_result, td_debug = fetch_twelvedata_quotes([key], td_api_key)
             if key in td_result:
                 r = td_result[key]
                 time.sleep(0.1)
                 return r, f"[twelvedata] 現在値={r['current']} 前日終値={r['prev_close']}", ""
+            else:
+                reason = td_debug.get(key, "不明な理由で取得できませんでした")
+                error_msg += f" / [twelvedata] {reason}"
         except Exception as e:
             error_msg += f" / [twelvedata] {type(e).__name__}: {e}"
 
