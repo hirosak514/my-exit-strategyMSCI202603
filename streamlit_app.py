@@ -540,7 +540,7 @@ def calculate_snapshot_profit_jpy(portfolio_dict, prices_dict, rate):
             total += diff * shares
     return total
 
-def aggregate_backups_profit(indices, td_api_key=None):
+def aggregate_backups_profit(indices, td_api_key=None, fetch_mode="parallel"):
     """
     指定したバックアップ（絶対インデックスのリスト）それぞれについて、
     保有銘柄の現在株価をもとにした損益（円換算）を計算し、その合計を返す。
@@ -581,7 +581,7 @@ def aggregate_backups_profit(indices, td_api_key=None):
     if not snapshots:
         return 0.0, 0
 
-    prices_dict, _ = get_prices_with_cache(all_keys, td_api_key=td_api_key)
+    prices_dict, _ = get_prices_with_cache(all_keys, td_api_key=td_api_key, fetch_mode=fetch_mode)
     rate = prices_dict.get("USDJPY", 159.2)
 
     grand_total = 0.0
@@ -702,6 +702,8 @@ if 'api_key' not in st.session_state:
     st.session_state.api_key = load_json(CONFIG_FILE, {"gemini_key": ""}).get("gemini_key", "")
 if 'twelvedata_key' not in st.session_state:
     st.session_state.twelvedata_key = load_json(CONFIG_FILE, {}).get("twelvedata_key", "")
+if 'fetch_mode' not in st.session_state:
+    st.session_state.fetch_mode = load_json(CONFIG_FILE, {}).get("fetch_mode", "parallel")  # "parallel" or "serial"
 # --- バックアップ履歴（前後移動）用の状態 ---
 if 'backup_cache' not in st.session_state:
     st.session_state.backup_cache = {}      # {絶対インデックス: {"timestamp":..., "data":...}}
@@ -1223,14 +1225,38 @@ def _fetch_single_symbol_price_cached(key, td_api_key):
 def _fetch_usdjpy_rate_cached(td_api_key):
     return _fetch_usdjpy_rate(td_api_key)
 
-def get_live_prices(portfolio_keys, td_api_key=None):
+def get_live_prices(portfolio_keys, td_api_key=None, fetch_mode="parallel"):
+    """
+    fetch_mode: "parallel"（既定・速い） または "serial"（1件ずつ順番に取得。
+    並列アクセスがYahoo側のBot検知にかかりやすい場合の代替手段。低速だが、
+    人間がブラウザで見るのに近いアクセスパターンになるため、レート制限を
+    受けにくくなる可能性がある）
+    """
     prices = {}
     fetch_errors = {}   # デバッグ用：銘柄ごとの失敗理由を記録
     fetch_debug = {}    # デバッグ用：成功時も含め、取得元・値を記録
     portfolio_keys = list(portfolio_keys)
 
-    if portfolio_keys:
-        # 銘柄ごとの取得はネットワークI/O待ちが支配的なので、並列化して高速化する。
+    def _handle_result(key, fetch_callable):
+        try:
+            result, debug_msg, error_msg = fetch_callable()
+        except PriceFetchFailed as e:
+            result, debug_msg, error_msg = None, "", str(e)
+        except Exception as e:
+            result, debug_msg, error_msg = None, "", f"{type(e).__name__}: {e}"
+        prices[key] = result
+        if debug_msg:
+            fetch_debug[key] = debug_msg
+        if error_msg:
+            fetch_errors[key] = error_msg
+
+    if portfolio_keys and fetch_mode == "serial":
+        # --- 直列処理：1銘柄ずつ順番に取得する ---
+        for key in portfolio_keys:
+            _handle_result(key, lambda k=key: _fetch_single_symbol_price_cached(k, td_api_key))
+
+    elif portfolio_keys:
+        # --- 並列処理（既定）：ネットワークI/O待ちが支配的なので並列化して高速化する。
         # ただし並列度が高すぎるとYahoo側のレート制限（Too Many Requests）を誘発するため、
         # 並列数を抑えつつ、各リクエストの開始タイミングを少しずつずらして
         # 瞬間的なバーストアクセスを避ける。
@@ -1248,17 +1274,7 @@ def get_live_prices(portfolio_keys, td_api_key=None):
             }
             for future in as_completed(future_to_key):
                 key = future_to_key[future]
-                try:
-                    result, debug_msg, error_msg = future.result()
-                except PriceFetchFailed as e:
-                    result, debug_msg, error_msg = None, "", str(e)
-                except Exception as e:
-                    result, debug_msg, error_msg = None, "", f"{type(e).__name__}: {e}"
-                prices[key] = result
-                if debug_msg:
-                    fetch_debug[key] = debug_msg
-                if error_msg:
-                    fetch_errors[key] = error_msg
+                _handle_result(key, future.result)
 
     rate, rate_error = _fetch_usdjpy_rate_cached(td_api_key)
     prices["USDJPY"] = rate
@@ -1269,7 +1285,7 @@ def get_live_prices(portfolio_keys, td_api_key=None):
     prices["_fetch_debug"] = fetch_debug
     return prices
 
-def get_prices_with_cache(portfolio_keys, td_api_key=None):
+def get_prices_with_cache(portfolio_keys, td_api_key=None, fetch_mode="parallel"):
     """
     ポートフォリオのキー集合から価格を取得する（銘柄単位で15分キャッシュ）。
     戻り値: (prices_dict, last_updated_datetime)
@@ -1277,7 +1293,7 @@ def get_prices_with_cache(portfolio_keys, td_api_key=None):
     keys_tuple = tuple(sorted(portfolio_keys))
     if not keys_tuple:
         return {"USDJPY": 159.2}, now_jst()
-    prices = get_live_prices(keys_tuple, td_api_key=td_api_key)
+    prices = get_live_prices(keys_tuple, td_api_key=td_api_key, fetch_mode=fetch_mode)
     return prices, now_jst()
 
 # 【オリジナルを完全踏襲】
@@ -1446,6 +1462,22 @@ with st.sidebar:
         st.success("Twelve Data APIキーを保存しました")
         st.rerun()
 
+    fetch_mode_label = st.radio(
+        "価格取得方式（Yahoo Finance）",
+        ["並列（デフォルト・速い）", "直列（レート制限に強い・遅い）"],
+        index=0 if st.session_state.fetch_mode == "parallel" else 1,
+        help="並列は高速だが、短時間に集中したアクセスとしてYahoo側のレート制限を"
+             "誘発しやすい。直列は1銘柄ずつ順番に取得するため低速だが、"
+             "人間の閲覧に近いアクセスパターンになりレート制限を受けにくくなる可能性がある。"
+    )
+    new_fetch_mode = "parallel" if fetch_mode_label.startswith("並列") else "serial"
+    if new_fetch_mode != st.session_state.fetch_mode:
+        st.session_state.fetch_mode = new_fetch_mode
+        cfg = load_json(CONFIG_FILE, {})
+        cfg["fetch_mode"] = new_fetch_mode
+        save_json(CONFIG_FILE, cfg)
+        st.rerun()
+
     st.divider()
 
     st.header("✏️ 銘柄情報の直接入力")
@@ -1579,7 +1611,8 @@ with st.sidebar:
             #    （サイドバーはメイン画面より先に描画されるため、ここで改めて取得する。
             #    既に取得済みの銘柄はキャッシュされているので追加コストは小さい）
             settle_prices_dict, _ = get_prices_with_cache(
-                st.session_state.portfolio.keys(), td_api_key=current_twelvedata_key
+                st.session_state.portfolio.keys(), td_api_key=current_twelvedata_key,
+                fetch_mode=st.session_state.fetch_mode
             )
             new_settled = {}
             for pkey in st.session_state.portfolio.keys():
@@ -1764,7 +1797,9 @@ with st.sidebar:
             scope_desc = f"全{len(target_indices)}件"
 
         with st.spinner(f"{scope_desc}を集計中..."):
-            grand_total, included = aggregate_backups_profit(target_indices, td_api_key=current_twelvedata_key)
+            grand_total, included = aggregate_backups_profit(
+                target_indices, td_api_key=current_twelvedata_key, fetch_mode=st.session_state.fetch_mode
+            )
 
         if grand_total is None:
             st.session_state["_aggregate_profit_result"] = None
@@ -2041,7 +2076,9 @@ if col_refresh.button('最新価格に更新'):
     _fetch_usdjpy_rate_cached.clear()
     st.rerun()
 
-prices_dict, last_updated = get_prices_with_cache(st.session_state.portfolio.keys(), td_api_key=current_twelvedata_key)
+prices_dict, last_updated = get_prices_with_cache(
+    st.session_state.portfolio.keys(), td_api_key=current_twelvedata_key, fetch_mode=st.session_state.fetch_mode
+)
 col_ts.caption(f"🕒 最終更新: {last_updated.strftime('%Y年%m月%d日 %H:%M:%S')}（15分ごとに自動更新）")
 rate = prices_dict.get("USDJPY", 159.2)
 
