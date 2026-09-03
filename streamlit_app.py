@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # --- 0. データの保存・読み込み ---
 # このバージョン文字列は改修のたびに更新される。デプロイ先で実際にこの値が表示されているか
 # 確認することで、「最新のコードが反映されているかどうか」を一目で判別できるようにするための目印。
-APP_VERSION = "2026-09-03-02 (ナビゲーションのエラー表示を修正)"
+APP_VERSION = "2026-09-03-03 (cache_min/max Noneクラッシュ修正)"
 
 DB_FILE = "portfolio.json"
 EVENT_FILE = "events.json"
@@ -275,7 +275,7 @@ def load_backup_window(center_idx=None, initial=False, direction=None):
     取得してマージする（境界付近を行き来した際に同じデータを再取得しないようにするため）。
     """
     gc = get_gspread_client()
-    if not gc: return
+    if not gc: return False
     try:
         sh = gc.open_by_url(FIXED_SHEET_URL)
         ws = sh.get_worksheet(0)
@@ -285,7 +285,7 @@ def load_backup_window(center_idx=None, initial=False, direction=None):
         st.session_state.backup_total = total
         if total == 0:
             _set_nav_msg("warning", "バックアップ履歴が見つかりません")
-            return
+            return False
 
         if initial:
             start_idx = max(1, total - INITIAL_CACHE_SIZE + 1)
@@ -332,7 +332,7 @@ def load_backup_window(center_idx=None, initial=False, direction=None):
 
         if not merged_cache:
             _set_nav_msg("warning", "該当する履歴データが見つかりませんでした")
-            return
+            return False
 
         st.session_state.backup_cache = merged_cache
         st.session_state.cache_min = new_min
@@ -343,11 +343,12 @@ def load_backup_window(center_idx=None, initial=False, direction=None):
             _set_nav_msg("error",
                 f"スプレッドシートの{target_idx + 1}行目（No.{target_idx}）のデータが読み込めませんでした。"
                 f"B列（データ列）が空欄・破損している可能性があります。スプレッドシートを直接確認してください。")
-            return
+            return False
 
-        apply_backup_index(target_idx)
+        return apply_backup_index(target_idx)
     except Exception as e:
         _set_nav_msg("error", f"履歴取得失敗: {e}")
+        return False
 
 def apply_backup_index(idx):
     """
@@ -402,10 +403,13 @@ def render_backup_nav_controls(key_prefix=""):
         st.session_state.cache_max = None
         if st.session_state.backup_index is not None:
             # 現在表示中の位置を保ったまま、その周辺を最新の内容で読み直す
-            load_backup_window(center_idx=st.session_state.backup_index)
+            reload_ok = load_backup_window(center_idx=st.session_state.backup_index)
         else:
-            load_backup_window(initial=True)
-        _set_nav_msg("success", "スプレッドシートを再読み込みしました")
+            reload_ok = load_backup_window(initial=True)
+        if reload_ok:
+            _set_nav_msg("success", "スプレッドシートを再読み込みしました")
+        # 失敗時は load_backup_window 内で既にエラー/警告メッセージがセットされているため、
+        # ここで上書きしない
         st.rerun()
 
     with st.container(key=f"{key_prefix}nav_arrows_row"):
@@ -439,7 +443,9 @@ def render_backup_nav_controls(key_prefix=""):
             target = st.session_state.backup_index - 1
             if target < 1:
                 _set_nav_msg("warning", "これ以上前の履歴はありません")
-            elif target < st.session_state.cache_min:
+            elif st.session_state.cache_min is None or target < st.session_state.cache_min:
+                # cache_min が None ＝ 直前の再読み込み等でキャッシュが空になった状態。
+                # 通常のdirection付き取得ではなく、centerを基準に取り直す
                 load_backup_window(center_idx=target, direction="prev")
             else:
                 apply_backup_index(target)
@@ -472,7 +478,9 @@ def render_backup_nav_controls(key_prefix=""):
             target = st.session_state.backup_index + 1
             if target > total:
                 _set_nav_msg("warning", "これより新しい履歴はありません（最新のバックアップです）")
-            elif target > st.session_state.cache_max:
+            elif st.session_state.cache_max is None or target > st.session_state.cache_max:
+                # cache_max が None ＝ 直前の再読み込み等でキャッシュが空になった状態。
+                # 通常のdirection付き取得ではなく、centerを基準に取り直す
                 load_backup_window(center_idx=target, direction="next")
             else:
                 apply_backup_index(target)
