@@ -18,6 +18,10 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 0. データの保存・読み込み ---
+# このバージョン文字列は改修のたびに更新される。デプロイ先で実際にこの値が表示されているか
+# 確認することで、「最新のコードが反映されているかどうか」を一目で判別できるようにするための目印。
+APP_VERSION = "2026-09-03-01 (JP株はTwelve Dataスキップ)"
+
 DB_FILE = "portfolio.json"
 EVENT_FILE = "events.json"
 REMINDER_FILE = "reminder.json"
@@ -1443,6 +1447,7 @@ components.html("""
 
 with st.sidebar:
     st.header("🔑 Settings")
+    st.caption(f"🏷️ コードバージョン: {APP_VERSION}")
     new_api_key = st.text_input("Gemini API Key", value=st.session_state.api_key, type="password")
     if st.button("APIキーを保存"):
         st.session_state.api_key = new_api_key
