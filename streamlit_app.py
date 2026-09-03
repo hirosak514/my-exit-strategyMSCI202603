@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # --- 0. データの保存・読み込み ---
 # このバージョン文字列は改修のたびに更新される。デプロイ先で実際にこの値が表示されているか
 # 確認することで、「最新のコードが反映されているかどうか」を一目で判別できるようにするための目印。
-APP_VERSION = "2026-09-03-01 (JP株はTwelve Dataスキップ)"
+APP_VERSION = "2026-09-03-02 (ナビゲーションのエラー表示を修正)"
 
 DB_FILE = "portfolio.json"
 EVENT_FILE = "events.json"
@@ -284,7 +284,7 @@ def load_backup_window(center_idx=None, initial=False, direction=None):
         total = get_backup_count(ws)
         st.session_state.backup_total = total
         if total == 0:
-            st.warning("バックアップ履歴が見つかりません")
+            _set_nav_msg("warning", "バックアップ履歴が見つかりません")
             return
 
         if initial:
@@ -331,26 +331,35 @@ def load_backup_window(center_idx=None, initial=False, direction=None):
                 merged_cache.update(cache)
 
         if not merged_cache:
-            st.warning("該当する履歴データが見つかりませんでした")
+            _set_nav_msg("warning", "該当する履歴データが見つかりませんでした")
             return
 
         st.session_state.backup_cache = merged_cache
         st.session_state.cache_min = new_min
         st.session_state.cache_max = new_max
+
+        if target_idx not in merged_cache:
+            # 範囲内のはずなのに、そのインデックスだけデータが無い＝該当行が壊れている・空欄の可能性
+            _set_nav_msg("error",
+                f"スプレッドシートの{target_idx + 1}行目（No.{target_idx}）のデータが読み込めませんでした。"
+                f"B列（データ列）が空欄・破損している可能性があります。スプレッドシートを直接確認してください。")
+            return
+
         apply_backup_index(target_idx)
     except Exception as e:
-        st.error(f"履歴取得失敗: {e}")
+        _set_nav_msg("error", f"履歴取得失敗: {e}")
 
 def apply_backup_index(idx):
     """
     キャッシュ済みの idx 番目のバックアップをセッションに反映する。
     閲覧中はディスクへの保存を行わない（毎回のボタン操作を軽くするため）。
     メモリ上の「復元」用スナップショット（backup_portfolio）は従来通り取っておく。
+    戻り値: 成功した場合True、失敗した場合False
     """
     entry = st.session_state.backup_cache.get(idx)
     if not entry:
-        st.warning("そのデータはまだキャッシュされていません")
-        return
+        _set_nav_msg("warning", f"No.{idx}のデータはまだキャッシュされていません")
+        return False
     backup_portfolio()
     data = entry["data"]
     st.session_state.portfolio = data.get("portfolio", {})
@@ -358,6 +367,26 @@ def apply_backup_index(idx):
     st.session_state.reminder_text = data.get("reminder_text", "")
     st.session_state.settled_prices = data.get("settled_prices", {})
     st.session_state.backup_index = idx
+    return True
+
+def _set_nav_msg(kind, text):
+    """
+    ナビゲーション系のボタンは処理直後に必ず st.rerun() するため、
+    その場で st.warning()/st.error() を呼んでもrerunで即座に消えてしまい、
+    ユーザーには「何も起きていない」ように見えてしまう。
+    そのためメッセージを一旦セッションに保存し、次の描画時に確実に表示する。
+    """
+    st.session_state["_nav_msg"] = (kind, text)
+
+def _show_pending_nav_msg():
+    if "_nav_msg" in st.session_state:
+        kind, text = st.session_state.pop("_nav_msg")
+        if kind == "error":
+            st.error(text)
+        elif kind == "success":
+            st.success(text)
+        else:
+            st.warning(text)
 
 def render_backup_nav_controls(key_prefix=""):
     """
@@ -365,6 +394,8 @@ def render_backup_nav_controls(key_prefix=""):
     サイドバー・メイン画面など複数箇所から呼び出せるよう、ウィジェットキーの重複を避けるために
     key_prefix を付与する（例: "sidebar_", "main_"）。
     """
+    _show_pending_nav_msg()
+
     if st.button("🔄 スプレッドシートを再読み込み", key=f"{key_prefix}reload_btn"):
         st.session_state.backup_cache = {}
         st.session_state.cache_min = None
@@ -374,7 +405,7 @@ def render_backup_nav_controls(key_prefix=""):
             load_backup_window(center_idx=st.session_state.backup_index)
         else:
             load_backup_window(initial=True)
-        st.success("スプレッドシートを再読み込みしました")
+        _set_nav_msg("success", "スプレッドシートを再読み込みしました")
         st.rerun()
 
     with st.container(key=f"{key_prefix}nav_arrows_row"):
@@ -388,12 +419,12 @@ def render_backup_nav_controls(key_prefix=""):
             filt = st.session_state.backup_filter_indices
             pos = st.session_state.backup_filter_pos
             if not filt:
-                st.warning("フィルター条件に一致するバックアップがありません")
+                _set_nav_msg("warning", "フィルター条件に一致するバックアップがありません")
             elif pos is None:
                 st.session_state.backup_filter_pos = len(filt) - 1
                 jump_to_backup_index(filt[-1], clear_filter=False)
             elif pos <= 0:
-                st.warning("フィルター条件に一致する、これより前のバックアップはありません")
+                _set_nav_msg("warning", "フィルター条件に一致する、これより前のバックアップはありません")
             else:
                 st.session_state.backup_filter_pos = pos - 1
                 jump_to_backup_index(filt[pos - 1], clear_filter=False)
@@ -407,7 +438,7 @@ def render_backup_nav_controls(key_prefix=""):
         else:
             target = st.session_state.backup_index - 1
             if target < 1:
-                st.warning("これ以上前の履歴はありません")
+                _set_nav_msg("warning", "これ以上前の履歴はありません")
             elif target < st.session_state.cache_min:
                 load_backup_window(center_idx=target, direction="prev")
             else:
@@ -420,12 +451,12 @@ def render_backup_nav_controls(key_prefix=""):
             filt = st.session_state.backup_filter_indices
             pos = st.session_state.backup_filter_pos
             if not filt:
-                st.warning("フィルター条件に一致するバックアップがありません")
+                _set_nav_msg("warning", "フィルター条件に一致するバックアップがありません")
             elif pos is None:
                 st.session_state.backup_filter_pos = 0
                 jump_to_backup_index(filt[0], clear_filter=False)
             elif pos >= len(filt) - 1:
-                st.warning("フィルター条件に一致する、これより後のバックアップはありません")
+                _set_nav_msg("warning", "フィルター条件に一致する、これより後のバックアップはありません")
             else:
                 st.session_state.backup_filter_pos = pos + 1
                 jump_to_backup_index(filt[pos + 1], clear_filter=False)
@@ -440,7 +471,7 @@ def render_backup_nav_controls(key_prefix=""):
             total = st.session_state.backup_total or st.session_state.backup_index
             target = st.session_state.backup_index + 1
             if target > total:
-                st.warning("これより新しい履歴はありません（最新のバックアップです）")
+                _set_nav_msg("warning", "これより新しい履歴はありません（最新のバックアップです）")
             elif target > st.session_state.cache_max:
                 load_backup_window(center_idx=target, direction="next")
             else:
@@ -456,7 +487,7 @@ def jump_to_backup_index(target_idx, clear_filter=True):
     検索結果内へのジャンプ時は呼び出し側で clear_filter=False を指定する）。
     """
     if st.session_state.backup_total is None or target_idx is None:
-        st.warning("バックアップ履歴の総件数が不明です。先に「🔄 スプレッドシートを再読み込み」を押してください。")
+        _set_nav_msg("warning", "バックアップ履歴の総件数が不明です。先に「🔄 スプレッドシートを再読み込み」を押してください。")
         return
     if clear_filter and st.session_state.backup_filter_indices is not None:
         st.session_state.backup_filter_query = ""
@@ -637,6 +668,7 @@ def render_backup_jump_controls(key_prefix=""):
     「⏮ 最古 / ⏭ 最新」「No.でジャンプ」「日付でジャンプ」の3種類のジャンプ機能を描画する。
     バックアップ件数が数百〜千件規模になっても、目的の位置に少ないクリックで到達できるようにする。
     """
+    _show_pending_nav_msg()
     if "_jump_msg" in st.session_state:
         st.info(st.session_state.pop("_jump_msg"))
 
